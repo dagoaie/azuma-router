@@ -12,7 +12,11 @@ Carga y validación estricta de `azuma.toml` (brazos, ventanas de cuota e hiperp
 - **THEN** `Config.arms` tiene longitud 2, `arms[0].arm_id == "gpt-5-codex@openai-codex"` y `arms[1].arm_id == "qwen3-coder@openrouter"` (AC-01)
 
 ### Requirement: Rechazo fail-fast con ruta de campo
-El cargador SHALL lanzar `ConfigError` con la ruta exacta del campo ofensivo (por ejemplo `arms[2].windows[0].capacity`) ante `arm_id` duplicado, sección obligatoria ausente, tipo incorrecto, `billing_mode = "subscription"` sin ventanas, o `billing_mode = "per_token"` con ventanas o con `barrier_mu > 0`. El cargador MUST NOT sustituir valores por defecto silenciosamente (FR-02).
+El cargador SHALL lanzar `ConfigError` con la ruta exacta del campo ofensivo (por ejemplo `arms[2].windows[0].capacity`) ante `arm_id` duplicado, sección obligatoria ausente, tipo incorrecto, valor numérico no finito o con `|v| > 2³¹ − 1` (incluida `capacity`), `tau < 1e-6`, `billing_mode = "subscription"` sin ventanas, o `billing_mode = "per_token"` con ventanas o con `barrier_mu > 0`. El cargador MUST NOT sustituir valores por defecto silenciosamente (FR-02).
+
+#### Scenario: temperatura degenerada
+- **WHEN** se carga un TOML con `bandit.tau = 1e-300`
+- **THEN** se lanza `ConfigError` con `field == "bandit.tau"`
 
 #### Scenario: brazo de suscripción sin ventanas
 - **WHEN** se carga un TOML donde un brazo `subscription` no declara `[[arms.windows]]`

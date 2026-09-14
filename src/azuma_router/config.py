@@ -13,6 +13,9 @@ from typing import Any
 from azuma_router.errors import ConfigError
 from azuma_router.types import MAX_INT31, StaticConfig
 
+# Softmax temperature floor: below this the policy collapses to argmax anyway (ADR-0008).
+MIN_TAU = 1e-6
+
 
 @dataclass(frozen=True)
 class WindowConfig:
@@ -137,8 +140,8 @@ def _parse_bandit_config(b_data: dict[str, Any]) -> BanditConfig:
         raise ConfigError("bandit.alpha", "alpha must be >= 0")
 
     tau = req_b("tau", float)
-    if tau <= 0:
-        raise ConfigError("bandit.tau", "tau must be > 0")
+    if tau < MIN_TAU:
+        raise ConfigError("bandit.tau", f"tau must be >= {MIN_TAU} (softmax temperature)")
 
     epsilon_floor = req_b("epsilon_floor", float)
     if not (0.0 <= epsilon_floor <= 0.5):
@@ -217,11 +220,9 @@ def _parse_window_config(w_data: Any, w_prefix: str) -> WindowConfig:
     cap = w_data.get("capacity")
     if cap is None:
         raise ConfigError(f"{w_prefix}.capacity", "Missing mandatory field 'capacity'")
-    if isinstance(cap, bool):
-        raise ConfigError(f"{w_prefix}.capacity", "capacity cannot be bool")
-    if isinstance(cap, int):
-        cap = float(cap)
-    if not isinstance(cap, float) or not math.isfinite(cap) or cap <= 0:
+    _check_type(cap, (int, float), f"{w_prefix}.capacity")
+    cap = float(cap)
+    if cap <= 0:
         raise ConfigError(f"{w_prefix}.capacity", "capacity must be a float > 0")
 
     duration_s: int | None = None

@@ -4,6 +4,7 @@ import io
 import json
 import math
 import shutil
+import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -14,7 +15,7 @@ import pytest
 
 from azuma_router import daemon as daemon_mod
 from azuma_router.config import load_config
-from azuma_router.daemon import Router, _read_line_bounded, main, serve
+from azuma_router.daemon import Router, ShutdownCoordinator, _read_line_bounded, main, serve
 from azuma_router.errors import (
     JournalWriteError,
     NumericalIntegrityError,
@@ -819,6 +820,56 @@ def test_boot_refuses_learned_updates_in_the_rotated_wal_without_a_snapshot(
     assert "wal_inconsistent" in events
 
 
+def _snapshot_meta_path(tmp_path: Path) -> Path:
+    router = _booted_router(tmp_path)
+    router.close()
+    return tmp_path / ".azuma" / "snapshot" / "state.json"
+
+
+def test_boot_exits_3_on_an_incompatible_snapshot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A snapshot from another schema is an operator problem, not a traceback (R4-MF-2)."""
+    meta_path = _snapshot_meta_path(tmp_path)
+    meta = json.loads(meta_path.read_text())
+    meta["schema_version"] = meta["schema_version"] + 1
+    meta_path.write_text(json.dumps(meta))
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "incompatible_snapshot" in events
+
+
+def test_boot_exits_3_when_the_snapshot_cannot_be_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    meta_path = _snapshot_meta_path(tmp_path)
+    meta_path.chmod(0o000)
+    try:
+        code, events = _boot_exit_code(tmp_path, capsys)
+    finally:
+        meta_path.chmod(0o644)
+
+    assert code == 3
+    assert "snapshot_read_failed" in events
+
+
+def test_boot_exits_3_when_the_journal_cannot_be_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    journal = tmp_path / "decisions.jsonl"
+    journal.write_text("")
+    journal.chmod(0o000)
+    try:
+        code, events = _boot_exit_code(tmp_path, capsys)
+    finally:
+        journal.chmod(0o644)
+
+    assert code == 3
+    assert "replay_failed" in events
+
+
 def test_boot_does_not_swallow_a_corrupt_line_while_checking_for_a_missing_snapshot(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -947,6 +998,25 @@ def test_report_on_an_expired_id_still_rotates_the_journal(tmp_path: Path) -> No
     restarted = _booted_router(tmp_path, clock_fn=lambda: clock[0])
     assert restarted.health({})["pending"] == 0
     restarted.close()
+
+
+def test_select_that_fails_validation_still_rotates_after_expiring(tmp_path: Path) -> None:
+    """Expiries journaled by a rejected select must not wait for the next success (R4-SF-2)."""
+    clock = [1_700_000_000.0]
+    router = _booted_router(tmp_path, clock_fn=lambda: clock[0])
+    d_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    router.dlog.max_bytes = 1  # type: ignore[union-attr]
+    _expire_all_pendings(clock)
+
+    with pytest.raises(RpcError) as excinfo:
+        router.select({"request": "not-an-object"})
+    assert excinfo.value.code == -32602
+
+    rotated_path = tmp_path / "decisions.1.jsonl"
+    assert rotated_path.exists(), "the expire append pushed the journal past max_bytes"
+    assert d_id in _select_ids(rotated_path)
+    assert _select_ids(tmp_path / "decisions.jsonl") == set(), "an expired select is not carried"
+    router.close()
 
 
 def test_snapshot_rpc_rotates_after_journaling_expiries(tmp_path: Path) -> None:
@@ -1182,3 +1252,55 @@ def test_serve_exits_4_when_a_result_contains_a_non_finite_float(
 
     assert code == 4
     assert [e["event"] for e in events if e["level"] == "error"] == ["numerical_integrity_error"]
+
+
+def _rpc_line(req_id: int, method: str, params: dict[str, object]) -> str:
+    return json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}) + "\n"
+
+
+def test_a_signal_while_idle_closes_and_exits_immediately(tmp_path: Path) -> None:
+    """Nothing is in flight between requests, so the handler may close synchronously (R4-MF-1)."""
+    router = _booted_router(tmp_path)
+    stderr = io.StringIO()
+    shutdown = ShutdownCoordinator(router, stderr)
+
+    with pytest.raises(SystemExit) as exit_info:
+        shutdown.on_signal(signal.SIGTERM, None)
+
+    assert exit_info.value.code == 0
+    assert (tmp_path / ".azuma" / "snapshot").exists(), "shutdown snapshot written"
+    events = [json.loads(line)["event"] for line in stderr.getvalue().splitlines()]
+    assert events == ["signal_received"]
+
+
+def test_a_signal_during_report_is_deferred_until_the_request_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A shutdown snapshot taken mid-update would persist a half-applied step (R4-MF-1)."""
+    router = _booted_router(tmp_path)
+    d_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    stdout, stderr = io.StringIO(), io.StringIO()
+    shutdown = ShutdownCoordinator(router, stderr)
+    real_update_jit = daemon_mod.update_jit
+
+    def update_jit_then_signal(*args: Any, **kwargs: Any) -> Any:
+        shutdown.on_signal(signal.SIGTERM, None)  # arrives while report() is mid-flight
+        return real_update_jit(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_mod, "update_jit", update_jit_then_signal)
+    stdin = io.StringIO(_rpc_line(1, "report", _report_params(d_id)) + _rpc_line(2, "health", {}))
+
+    with pytest.raises(SystemExit) as exit_info:
+        serve(stdin, stdout, stderr, router, exit_on_eof=False, shutdown=shutdown)
+
+    assert exit_info.value.code == 0
+    replies = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert [r["id"] for r in replies] == [1], "the in-flight report is answered, nothing after it"
+    assert replies[0]["result"]["applied"] is True
+    events = [json.loads(line)["event"] for line in stderr.getvalue().splitlines()]
+    assert events == ["signal_received", "shutdown_deferred"]
+
+    restarted = _booted_router(tmp_path)
+    assert restarted.health({})["pending"] == 0
+    assert restarted.health({})["state_version"] == 1
+    restarted.close()

@@ -44,7 +44,7 @@ Cada decisión cita el ADR que la fija; aquí se describe **cómo** se materiali
 `r = clip(w_q·q − w_c·min(cost/cost_budget, 1) − w_l·min(lat/latency_budget, 1), 0, 1)` en `reward.py`, sin JAX. Brazos `subscription` reportan `cost_usd = 0` (validado en el daemon ⇒ `-32602`).
 
 ### D8 — Política softmax con suelo ε y propensity registrada (ADR-0008)
-`π = (1−ε)·softmax(score/τ) + ε/K_act` sobre activos; `arm = categorical(sub_key, log π)`; `rng_key` se avanza con `split` y vive en el estado. Garantiza `π_a ≥ ε/K_act` para IPS/DR. Con `K_act = 0` se usa `where(no_arm, 0, arm)` para no propagar NaN; el daemon lee `no_arm_available` antes que `arm`.
+`π = (1−ε)·softmax(score/τ) + ε/K_act` sobre activos, calculado como `exp((score − max)/τ)` (restar el máximo **antes** de dividir: con τ pequeño `score/τ` desborda a `inf − inf = NaN`); `τ ≥ 1e-6` en config; `arm = categorical(sub_key, log π)`; `rng_key` se avanza con `split` y vive en el estado. Garantiza `π_a ≥ ε/K_act` para IPS/DR. Con `K_act = 0` se usa `where(no_arm, 0, arm)` para no propagar NaN; el daemon lee `no_arm_available` antes que `arm`.
 
 ### D9 — Snapshot safetensors + JSON, publicado por rename de directorio (ADR-0009)
 `snapshot.tmp/` → fsync ficheros y directorio → `snapshot/ → snapshot.old/` → `snapshot.tmp/ → snapshot/` → fsync del directorio padre (la entrada `snapshot/` es durable) → borrar `snapshot.old/`. `config_sha256` = SHA-256 del JSON canónico (`sort_keys`) del `Config` validado completo. Al arrancar: `snapshot.old/` sin `snapshot/` ⇒ recuperar `old`; `snapshot.tmp/` residual ⇒ borrar. `restore` valida `SnapshotMeta` (schema_version, d, k_max, w_max, featurizer_version, arm_ids) **antes** de leer tensores; nunca migra (F10). `config_sha256` distinto con formas iguales ⇒ warning.
@@ -93,11 +93,13 @@ Dependencias solo hacia abajo: `daemon → {wal, snapshot, quota, reward, featur
 
 ## Sequences
 
-**`select`**: barrido de expirados → parse `request` (`-32602`) → `featurize` (`-32001`) → `allowed` (`-32602`) → `est_units` por brazo → `QuotaView(utilization(now), est, allowed)` → `select_jit` → si `no_arm_available` ⇒ `-32004` sin journal ni avance de estado → `ledger.record` → `uuid7()` → `log.append(select)` + flush → `pending[id] = Pending(...)` → `self.state = state'` → respuesta.
+**`select`**: barrido de expirados → `rotate_if_needed()` (los `expire` cuentan aunque la petición se rechace) → parse `request` (`-32602`) → `featurize` (`-32001`) → `allowed` (`-32602`) → `est_units` por brazo → `QuotaView(utilization(now), est, allowed)` → `select_jit` → si `no_arm_available` ⇒ `-32004` sin journal ni avance de estado → `ledger.record` → `uuid7()` → `log.append(select)` + flush → `pending[id] = Pending(...)` → `self.state = state'` → respuesta.
 
 **`report`**: validar (`-32602`) → buscar pendiente (`-32002` / duplicado si en `applied_ids`) → expirado (`-32003`, con `expire` journalizado y rotación evaluada) → `compute_reward` → `ledger.has_event` (ausente ⇒ `ledger_integrity_error`, salida 4 sin journal) → `log.append(report, state_version + 1)` → `ledger.correct` → `state_version += 1` → `self.state = update_jit(...)` → `pending.pop`, `applied_ids.add` → `maybe_snapshot()` → `rotate_if_needed()` → respuesta. El ledger retiene eventos `max(ventana más larga, pending_ttl_s)` para que `correct` siempre encuentre su evento.
 
-**`boot`**: `load_config` → `restore` o `init_state` (+ limpieza de `snapshot.tmp/`, recuperación de `snapshot.old/`) → `replay` (reconstruir pendientes; reaplicar reports posteriores al snapshot) → `warmup` → `ready` → `serve`.
+**`boot`**: `load_config` → `restore` o `init_state` (+ limpieza de `snapshot.tmp/`, recuperación de `snapshot.old/`) → `replay` (reconstruir pendientes; reaplicar reports posteriores al snapshot) → `warmup` → `ready` → `serve`. Todo fallo de arranque que requiere al operador (`config_error`, `incompatible_snapshot`, `snapshot_read_failed`, `replay_failed`, `wal_inconsistent`) es un evento JSON en stderr + salida 3; nunca un traceback.
+
+**`shutdown`**: `ShutdownCoordinator` recibe SIGTERM/SIGINT. Sin petición en curso cierra en el propio handler (un flag puro colgaría en el `readline` bloqueante, PEP 475); con una petición en curso marca `shutdown_deferred` y cierra al terminar `_handle_request`, de modo que el snapshot de cierre nunca captura un `report` a medio aplicar. `serve` recibe el coordinador como parámetro para poder probarlo sin señales reales.
 
 ## Risks / Trade-offs
 

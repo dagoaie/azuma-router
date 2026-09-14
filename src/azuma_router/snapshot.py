@@ -152,10 +152,10 @@ def restore_snapshot(
         msg = f"Snapshot directory {target_dir} is missing state.json or state.safetensors"
         raise IncompatibleSnapshotError(msg)
 
-    # Read and parse metadata
+    # Read (OSError propagates: unreadable != incompatible) and parse metadata
+    meta_text = json_path.read_text(encoding="utf-8")
     try:
-        meta_dict = json.loads(json_path.read_text(encoding="utf-8"))
-        meta = SnapshotMeta.from_dict(meta_dict)
+        meta = SnapshotMeta.from_dict(json.loads(meta_text))
     except Exception as err:
         msg = f"Failed to parse snapshot metadata: {err}"
         raise IncompatibleSnapshotError(msg) from err

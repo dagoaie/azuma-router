@@ -61,10 +61,10 @@ def _select_pure(
     k_act = jnp.sum(active.astype(I32))
     no_arm_available = k_act == 0
 
-    logits = score / static.tau
-    logits_safe = jnp.where(active, logits, -1e9)
-    max_logit = jnp.max(logits_safe)
-    exp_logits = jnp.where(active, jnp.exp(logits - max_logit), 0.0)
+    # Subtract the max *before* dividing by tau: (s - max) <= 0, so a tiny tau can only
+    # push a logit to -inf (exp -> 0), never to inf - inf = NaN (R4-SF-1).
+    max_score = jnp.max(jnp.where(active, score, -jnp.inf))
+    exp_logits = jnp.where(active, jnp.exp((score - max_score) / static.tau), 0.0)
     sum_exp = jnp.sum(exp_logits)
     p_softmax = jnp.where(sum_exp > 0.0, exp_logits / sum_exp, 0.0)
 

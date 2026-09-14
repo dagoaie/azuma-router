@@ -1,5 +1,6 @@
 """Tests for LinUCB select logic, scoring, and sampling (T07 & T08)."""
 
+import dataclasses
 import math
 from pathlib import Path
 
@@ -119,3 +120,25 @@ def test_sampling_frequency() -> None:
 
     freqs = np.array(pulls) / n_samples
     np.testing.assert_allclose(freqs, expected_policy[:2], atol=0.02)
+
+
+def test_softmax_policy_stays_finite_for_any_positive_temperature() -> None:
+    """R4-SF-1: dividing by tau before subtracting the max overflows to inf - inf = NaN."""
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    # score / tau overflows to inf here; a subnormal tau is not used because XLA
+    # flushes float64 subnormals to zero (and MIN_TAU keeps it unreachable anyway).
+    static = dataclasses.replace(to_static_config(cfg), tau=1e-300)
+    state = init_state(cfg)
+    x = np.zeros(32, dtype=np.float64)
+    x[0] = 1e9
+    qv = QuotaView(
+        utilization=jnp.zeros((32, 4), dtype=F32),
+        est_units=jnp.zeros(32, dtype=F32),
+        allowed=jnp.ones(32, dtype=bool),
+    )
+
+    _state, _arm, propensity, diag = select(state, jnp.array(x, dtype=F64), qv, static)
+
+    assert np.isfinite(np.asarray(diag.policy)).all()
+    assert math.isclose(float(jnp.sum(diag.policy)), 1.0, rel_tol=1e-9)
+    assert math.isfinite(float(propensity)) and float(propensity) > 0.0

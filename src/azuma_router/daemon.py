@@ -12,7 +12,8 @@ import signal
 import sys
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NoReturn, TextIO
 
@@ -22,6 +23,7 @@ from azuma_router.config import Config, load_config, to_static_config
 from azuma_router.errors import (
     AzumaError,
     ConfigError,
+    IncompatibleSnapshotError,
     InvalidContextError,
     InvalidRequestLineError,
     JournalWriteError,
@@ -165,6 +167,12 @@ def _build_select_diagnostics(
     }
 
 
+def _exit_unrecoverable(event: str, reason: object) -> NoReturn:
+    """Boot cannot continue without operator action: structured stderr event, exit 3 (ADR-0014)."""
+    _log_event(sys.stderr, "error", event, error=str(reason))
+    sys.exit(3)
+
+
 class Router:
     """Orchestrates bandit state, quota ledger, WAL, and snapshot lifecycle (ADR-0010)."""
 
@@ -202,7 +210,12 @@ class Router:
         rotated_path = self.decision_log_path.with_name(r_name)
 
         # 1. Restore snapshot or clean init
-        res_snap = restore_snapshot(self.snapshot_dir, self.config)
+        try:
+            res_snap = restore_snapshot(self.snapshot_dir, self.config)
+        except IncompatibleSnapshotError as err:
+            _exit_unrecoverable("incompatible_snapshot", err)
+        except OSError as err:
+            _exit_unrecoverable("snapshot_read_failed", err)
         restored_state, restored_ledger, restored_meta = res_snap
 
         if restored_state is not None and restored_ledger is not None and restored_meta is not None:
@@ -226,9 +239,8 @@ class Router:
                 config=self.config,
                 ledger=self.ledger,
             )
-        except ValueError as err:
-            _log_event(sys.stderr, "error", "replay_failed", error=str(err))
-            sys.exit(3)
+        except (ValueError, OSError) as err:
+            _exit_unrecoverable("replay_failed", err)
 
         self.pending_store = p_store
 
@@ -289,13 +301,11 @@ class Router:
         """A journaled update in any retained segment needs the snapshot it built on (P3-MF-2)."""
         try:
             learned_version = journal_state_version(self.decision_log_path, rotated_path)
-        except ValueError as err:
-            _log_event(sys.stderr, "error", "replay_failed", error=str(err))
-            sys.exit(3)
+        except (ValueError, OSError) as err:
+            _exit_unrecoverable("replay_failed", err)
         if learned_version > 0:
             msg = f"WAL holds state_version {learned_version} but no snapshot/ directory exists"
-            _log_event(sys.stderr, "error", "wal_inconsistent", error=msg)
-            sys.exit(3)
+            _exit_unrecoverable("wal_inconsistent", msg)
 
     def _journal_expire(self, decision_id: str, ts_select: float, now: float) -> None:
         """Appends the single expire WAL line shape shared by every expiry path (P3-SF-1)."""
@@ -335,6 +345,8 @@ class Router:
 
         now = self.clock()
         self._sweep_expired(now)
+        # Expire appends count towards rotation even if this request is rejected (R4-SF-2).
+        self._rotate_if_needed()
 
         # Parse request
         req_raw = params.get("request")
@@ -786,7 +798,7 @@ def _validate_request(line_str: str) -> dict[str, Any]:
     """Parses one line as a JSON-RPC 2.0 request; rejects NaN/Infinity and bad ids (P3-MF-4)."""
     try:
         payload = json.loads(line_str, parse_constant=_reject_json_constant)
-    except ValueError as err:
+    except (ValueError, RecursionError) as err:  # RecursionError: nesting deeper than the decoder
         raise InvalidRequestLineError(_error_response(None, -32700, "Parse error")) from err
     if isinstance(payload, list):
         msg = "Batch requests are not supported"
@@ -799,6 +811,10 @@ def _validate_request(line_str: str) -> dict[str, Any]:
         raise InvalidRequestLineError(_error_response(None, -32600, "Invalid request", data))
     if payload.get("jsonrpc") != "2.0" or "method" not in payload:
         raise InvalidRequestLineError(_error_response(req_id, -32600, "Invalid request"))
+    if "params" in payload and not isinstance(payload["params"], dict):
+        data = {"field": "params"}
+        msg = "params must be an object"
+        raise InvalidRequestLineError(_error_response(req_id, -32602, msg, data))
     return payload
 
 
@@ -806,15 +822,17 @@ def _handle_request(
     stdout: TextIO, stderr: TextIO, router: Router, request: dict[str, Any]
 ) -> None:
     """Dispatches one validated request; fatal integrity errors terminate the process (exit 4)."""
+    # JSON-RPC 2.0: only an *absent* id makes a notification; `"id": null` still gets a reply.
+    is_notification = "id" not in request
     req_id = request.get("id")
     try:
         result = _dispatch_rpc_method(router, request["method"], request.get("params", {}))
-        if req_id is not None:
+        if not is_notification:
             _write_response(stdout, {"jsonrpc": "2.0", "id": req_id, "result": result})
     except _FATAL_ERRORS as err:
         _exit_fatal(stderr, router, err, phase="serve")
     except RpcError as err:
-        if req_id is not None:
+        if not is_notification:
             _write_response(stdout, _error_response(req_id, err.code, err.message, err.data))
         else:
             error_obj: dict[str, Any] = {"code": err.code, "message": err.message}
@@ -823,8 +841,50 @@ def _handle_request(
             _log_event(stderr, "error", "rpc_notification_error", error=error_obj)
     except Exception as err:
         _log_event(stderr, "error", "unhandled_error", error=str(err))
-        if req_id is not None:
+        if not is_notification:
             _write_response(stdout, _error_response(req_id, -32603, f"Internal error: {err}"))
+
+
+class ShutdownCoordinator:
+    """Turns SIGTERM/SIGINT into a shutdown that never interrupts a request (R4-MF-1).
+
+    Python runs signal handlers between bytecodes on the main thread, so a handler that closes
+    the router synchronously can snapshot a half-applied `report`. While a request is in flight
+    the signal is only recorded and honoured once the request has been answered; while idle the
+    handler closes immediately (a pure flag would hang in the blocking `readline`, PEP 475).
+    """
+
+    def __init__(self, router: Router, stderr: TextIO) -> None:
+        self._router = router
+        self._stderr = stderr
+        self._in_flight = False
+        self._requested = False
+        self._closing = False
+
+    def on_signal(self, sig: int, _frame: Any) -> None:
+        _log_event(self._stderr, "info", "signal_received", signal=sig)
+        if self._closing:
+            return
+        if self._in_flight:
+            self._requested = True
+            _log_event(self._stderr, "info", "shutdown_deferred", signal=sig)
+            return
+        self.close_and_exit()
+
+    @contextmanager
+    def in_flight(self) -> Iterator[None]:
+        """Marks a request as in flight; a shutdown requested meanwhile runs on exit."""
+        self._in_flight = True
+        try:
+            yield
+        finally:
+            self._in_flight = False
+            if self._requested:
+                self.close_and_exit()
+
+    def close_and_exit(self) -> NoReturn:
+        self._closing = True
+        sys.exit(self._router.close())
 
 
 def serve(
@@ -833,6 +893,7 @@ def serve(
     stderr: TextIO,
     router: Router,
     exit_on_eof: bool = True,
+    shutdown: ShutdownCoordinator | None = None,
 ) -> None:
     """Reads JSON-RPC 2.0 requests line by line from stdin and writes to stdout (FR-29)."""
     while True:
@@ -853,7 +914,11 @@ def serve(
         except InvalidRequestLineError as rejected:
             _write_response(stdout, rejected.response)
             continue
-        _handle_request(stdout, stderr, router, request)
+        if shutdown is None:
+            _handle_request(stdout, stderr, router, request)
+        else:
+            with shutdown.in_flight():
+                _handle_request(stdout, stderr, router, request)
 
 
 def main() -> None:
@@ -868,14 +933,9 @@ def main() -> None:
         sys.exit(3)
 
     router = Router(cfg)
-
-    def handle_signal(_sig: int, _frame: Any) -> None:
-        _log_event(sys.stderr, "info", "signal_received", signal=_sig)
-        code = router.close()
-        sys.exit(code)
-
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
+    shutdown = ShutdownCoordinator(router, sys.stderr)
+    signal.signal(signal.SIGTERM, shutdown.on_signal)
+    signal.signal(signal.SIGINT, shutdown.on_signal)
 
     try:
         ready_params = router.boot()
@@ -885,7 +945,7 @@ def main() -> None:
     sys.stdout.write(json.dumps(ready_notif) + "\n")
     sys.stdout.flush()
 
-    serve(sys.stdin, sys.stdout, sys.stderr, router)
+    serve(sys.stdin, sys.stdout, sys.stderr, router, shutdown=shutdown)
 
 
 if __name__ == "__main__":

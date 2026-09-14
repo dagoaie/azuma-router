@@ -152,3 +152,53 @@ def test_a_request_id_that_is_not_a_string_integer_or_null_is_an_invalid_request
         "id": None,
         "error": {"code": -32600, "message": "Invalid request", "data": {"reason": "invalid_id"}},
     }
+
+
+def test_an_explicit_null_id_is_a_request_not_a_notification(tmp_path: Path) -> None:
+    """R4-MF-3: JSON-RPC 2.0 distinguishes an absent id (notification) from `"id": null`."""
+    router = _booted_router(tmp_path)
+
+    out = _serve_lines(
+        router,
+        '{"jsonrpc":"2.0","id":null,"method":"health"}',
+        '{"jsonrpc":"2.0","id":null,"method":"nope"}',
+        '{"jsonrpc":"2.0","method":"health"}',
+    )
+
+    assert len(out) == 2, "two null-id requests answered, the notification stays silent"
+    assert json.loads(out[0])["id"] is None and "result" in json.loads(out[0])
+    assert json.loads(out[1]) == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32601, "message": "Method not found: nope"},
+    }
+
+
+@pytest.mark.parametrize("method", ["select", "report", "snapshot", "health"])
+@pytest.mark.parametrize("params", ["null", "[]", "1", '"x"'])
+def test_params_that_are_not_an_object_are_invalid_params(
+    tmp_path: Path, method: str, params: str
+) -> None:
+    """R4-MF-4: a structurally wrong `params` is the caller's error (-32602), never -32603."""
+    router = _booted_router(tmp_path)
+
+    out = _serve_lines(router, f'{{"jsonrpc":"2.0","id":3,"method":"{method}","params":{params}}}')
+
+    assert json.loads(out[0])["error"] == {
+        "code": -32602,
+        "message": "params must be an object",
+        "data": {"field": "params"},
+    }
+
+
+def test_a_pathologically_nested_line_is_a_parse_error_and_the_loop_survives(
+    tmp_path: Path,
+) -> None:
+    """R4-SF-4: the stdlib decoder recurses per nesting level; that must not kill the daemon."""
+    router = _booted_router(tmp_path)
+
+    nested = "[" * 100_000 + "]" * 100_000
+    out = _serve_lines(router, nested, '{"jsonrpc":"2.0","id":9,"method":"health"}')
+
+    assert json.loads(out[0])["error"]["code"] == -32700
+    assert json.loads(out[1])["id"] == 9

@@ -27,7 +27,11 @@ Núcleo LinUCB disjunto compilado en JAX: estado inmutable PyTree con formas est
 - **THEN** `bonus[a]` decrece monótonamente tras cada `update`
 
 ### Requirement: Política de muestreo con propensity
-`select` SHALL muestrear el brazo según $\pi = (1-\varepsilon)\,\mathrm{softmax}(\text{score}/\tau) + \varepsilon/K_{act}$ restringida a brazos activos, devolver `propensity = π[arm]` y `diagnostics.policy` completa. Ningún brazo activo SHALL tener `π < ε/K_act` y la suma sobre activos SHALL ser `1` (±1e-12) (FR-08).
+`select` SHALL muestrear el brazo según $\pi = (1-\varepsilon)\,\mathrm{softmax}(\text{score}/\tau) + \varepsilon/K_{act}$ restringida a brazos activos, devolver `propensity = π[arm]` y `diagnostics.policy` completa. Ningún brazo activo SHALL tener `π < ε/K_act` y la suma sobre activos SHALL ser `1` (±1e-12) (FR-08). El softmax SHALL restar el máximo antes de dividir por `τ`, de modo que `π` sea finita para cualquier `τ > 0` no subnormal aunque `score/τ` desbordara.
+
+#### Scenario: temperatura extrema
+- **WHEN** `τ = 1e-300` y un `score` de `1e9`
+- **THEN** `policy` es finita y suma `1`
 
 #### Scenario: un solo brazo
 - **WHEN** solo hay un brazo activo

@@ -65,7 +65,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 - **FR-25** `snapshot(state, ledger, meta, dir)` DEBE escribir `state.safetensors` + `state.json` en `<dir>/snapshot.tmp/`, `fsync` ambos, `fsync` del directorio, `rename` a `<dir>/snapshot/` (reemplazando el anterior de forma atómica) y `fsync` del directorio padre antes de borrar `snapshot.old/`. Un `OSError` en cualquier paso ⇒ `snapshot_write_error`, salida código 4. `config_sha256` = SHA-256 del JSON canónico del `Config` validado completo.
 - **FR-26** `restore(dir, config) -> (state, ledger, meta)` DEBE lanzar `IncompatibleSnapshotError` si difiere cualquiera de: `schema_version`, `d`, `K_max`, `W_max`, `featurizer_version`, `arm_ids`. Nunca migrar.
 - **FR-27** `restore(snapshot(s)) == s` bitwise para todos los arrays.
-- **FR-28** El daemon DEBE hacer snapshot cuando `updates_since_snapshot ≥ 100` **o** `now − last_snapshot ≥ 30 s` (evaluado tras cada `report`) y en shutdown limpio (EOF en stdin o SIGTERM).
+- **FR-28** El daemon DEBE hacer snapshot cuando `updates_since_snapshot ≥ 100` **o** `now − last_snapshot ≥ 30 s` (evaluado tras cada `report`) y en shutdown limpio (EOF en stdin o SIGTERM/SIGINT). Una señal recibida mientras una petición está en curso se **difiere** hasta que esa petición ha respondido (`shutdown_deferred`); nunca se hace snapshot a mitad de un `report`.
 
 ### 3.8 Daemon JSON-RPC (ADR-0010, 0013, 0014)
 - **FR-29** El daemon lee líneas de `stdin`, una petición JSON-RPC 2.0 por línea, y escribe una respuesta por línea en `stdout`; `stderr` solo logs JSON estructurados.
@@ -93,7 +93,7 @@ w_max             = 4                   # int, 1..8; forma estática
 d                 = 32                  # int, DEBE ser 32 en featurizer v1
 ridge_lambda      = 1.0                 # float > 0
 alpha             = 1.0                 # float ≥ 0
-tau               = 0.05                # float > 0
+tau               = 0.05                # float ≥ 1e-6 (temperatura; por debajo el softmax degenera en float64)
 epsilon_floor     = 0.02                # float en [0, 0.5]
 w_quality         = 1.0                 # float ≥ 0
 w_cost            = 0.3                 # float ≥ 0
@@ -120,7 +120,7 @@ barrier_mu        = 0.5                 # float ≥ 0; DEBE ser 0 si per_token
   [[arms.windows]]                      # 1..w_max entradas; obligatorio si subscription, prohibido si per_token
   kind        = "rolling"               # "rolling" | "fixed_reset"
   duration_s  = 18000                   # int > 0; solo rolling (5 h)
-  capacity    = 300.0                   # float > 0, en units
+  capacity    = 300.0                   # float > 0 y ≤ 2³¹ − 1 (FR-02), en units
 
   [[arms.windows]]
   kind         = "fixed_reset"
@@ -296,16 +296,16 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 
 | code | name | cuándo |
 |---|---|---|
-| −32700 | ParseError | línea no es JSON estricto (incluye `NaN`/`Infinity`); `id` siempre `null` |
+| −32700 | ParseError | línea no es JSON estricto (incluye `NaN`/`Infinity` y anidamiento más profundo que el decodificador); `id` siempre `null`; el bucle continúa |
 | −32600 | InvalidRequest | falta `jsonrpc:"2.0"`/`method`, batch, o `id` que no es string/entero/null (`data.reason = "invalid_id"`, se responde con `id: null`) |
 | −32601 | MethodNotFound | |
-| −32602 | InvalidParams | tipo/rango; `data.field` |
+| −32602 | InvalidParams | tipo/rango; `data.field`. Incluye `params` presente y no objeto (`data.field = "params"`, se responde con el `id` de la petición) |
 | −32001 | InvalidContext | featurizer rechaza; `data.field`, `data.reason` |
 | −32002 | UnknownDecision | |
 | −32003 | DecisionExpired | |
 | −32004 | NoArmAvailable | |
 | −32005 | NotReady | antes de `ready` |
-| −32006 | IncompatibleSnapshot | solo en arranque; el daemon escribe el error en stderr y sale con código 3 |
+| −32006 | IncompatibleSnapshot | solo en arranque; el daemon escribe `incompatible_snapshot` en stderr y sale con código 3 |
 
 ---
 
@@ -321,18 +321,20 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 | `input_tokens ≥ 10^6` | $x_1 = 1$ (clip). |
 | Línea stdin vacía | Ignorada silenciosamente. |
 | Línea > 1 MiB | `-32600`, `data.reason = "line_too_long"`. |
-| `id` ausente en `select`/`report` (notificación) | Se procesa pero no se responde (semántica JSON-RPC); se registra en stderr. |
+| `id` ausente en `select`/`report` (notificación) | Se procesa pero no se responde (semántica JSON-RPC); se registra en stderr. Un `"id": null` explícito **no** es notificación: se responde con `id: null`. |
 | `report` llega antes de que `select` haya hecho flush | Imposible: `select` responde solo tras flush (FR-20). |
 | Crash entre línea `select` y respuesta | Al arrancar, replay ve `select` sin `report`: pendiente; expirará o se reportará. |
 | Crash entre línea `report` y `update` aplicado | Replay reaplica `report` (línea existe, `state_version` del snapshot menor): `update` es idempotente por replay porque solo se reaplica si `state_version_line > snapshot.state_version`. |
 | Snapshot `.tmp` residual al arrancar | Se borra; se restaura `snapshot/` si existe. |
 | `snapshot/` ausente | Estado inicial (FR-07); `ready.restored_from_snapshot = false`; WAL existente se **rechaza** si cualquiera de los dos segmentos (`decisions.jsonl`, `decisions.1.jsonl`) contiene `state_version > 0` (inconsistencia) ⇒ salida código 3; un segmento corrupto durante esa comprobación ⇒ `replay_failed`, salida 3. |
 | `arm_ids` del snapshot ≠ config | `IncompatibleSnapshotError`, salida código 3, mensaje con el diff de listas. |
+| Snapshot o WAL ilegibles (permisos, E/S) en arranque | `snapshot_read_failed` / `replay_failed` en stderr, salida código 3; nunca un traceback. |
 | `config_sha256` ≠ pero `arm_ids` y formas iguales (cambió `alpha`, pesos…) | Se acepta: hiperparámetros son valor, no forma; se anota `warning` en stderr. |
 | JSONL con línea corrupta al final (crash a mitad de escritura) | Replay descarta **solo la última línea** si no parsea; una línea corrupta no final ⇒ salida código 3. |
-| Rotación durante replay | No aplica: la rotación se evalúa tras cada `append` (`select`/`report`/`expire`) en servicio, nunca en replay; va precedida de snapshot y arrastra los `select` vivos al fichero nuevo. |
+| Rotación durante replay | No aplica: la rotación se evalúa tras cada `append` (`select`/`report`/`expire`) en servicio, nunca en replay; va precedida de snapshot y arrastra los `select` vivos al fichero nuevo. Los `expire` escritos al inicio de un `select` cuentan aunque ese `select` acabe rechazado. |
 | `NaN` en `A` (imposible por construcción) | `select` DEBE assert `jnp.isfinite(score).all()` fuera del JIT sobre `diagnostics`; fallo ⇒ excepción y salida código 4 (estado corrupto; no se hace snapshot). |
 | SIGTERM durante escritura de snapshot | El rename es atómico: o queda el anterior o el nuevo, nunca mixto. |
+| SIGTERM/SIGINT con una petición en curso | Se registra `signal_received` + `shutdown_deferred`; la petición responde y después se cierra (snapshot + exit). Una segunda señal durante el cierre se ignora. |
 | Fallo de E/S persistente (WAL abrir/escribir/rotar, snapshot) | `journal_write_error` ⇒ salida 4 **con** snapshot de cierre; `snapshot_write_error` ⇒ salida 4 sin reintentar el snapshot. Nunca se responde OK a una petición cuya línea no llegó al journal. |
 | Respuesta con `NaN`/`Infinity` (serialización) | Imposible por construcción (`allow_nan=False`); si ocurre ⇒ `numerical_integrity_error`, salida 4 sin snapshot. |
 | Reloj retrocede (NTP) | El ledger usa `time.time()`; un salto atrás puede rejuvenecer eventos; se acepta (ventanas se recuperan solas). Se registra `warning` si `now < last_ts − 1 s`. |
@@ -376,7 +378,7 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 - **NFR-01 Latencia**: `select_jit` p99 < 1 ms y `update_jit` p99 < 0.5 ms en CPU (`K_max=32, d=32, W_max=4`), medidos con `pytest-benchmark` tras warm-up, ≥ 1 000 iteraciones. Round-trip completo del daemon (`select` incl. featurizer, WAL flush y JSON) p99 < 3 ms en el mismo host.
 - **NFR-02 Warm-up**: tiempo desde arranque hasta `ready` < 5 s en CPU arm64/x86_64 (se reporta en `ready.warmup_ms`).
 - **NFR-03 Memoria**: estado ≤ 32·32·32·8 B ≈ 262 KiB por copia; el daemon retiene ≤ 2 copias (actual + snapshot en curso).
-- **NFR-04 Observabilidad**: stderr en JSON (`ts`, `level`, `event`, campos); eventos mínimos: `ready`, `snapshot_written`, `pending_expired`, `report_duplicate`, `clock_skew`.
+- **NFR-04 Observabilidad**: stderr en JSON (`ts`, `level`, `event`, campos); eventos mínimos: `ready`, `snapshot_written`, `pending_expired`, `report_duplicate`, `clock_skew`, `signal_received`, `shutdown_deferred`.
 - **NFR-05 Tipado**: `mypy --strict` sin errores; `jaxtyping` NO se usa (anotaciones de forma en docstrings).
 - **NFR-06 Determinismo**: mismo `seed` + misma secuencia de peticiones y reports ⇒ mismo JSONL bitwise (excepto `ts`).
 - **NFR-07 Seguridad**: nunca `pickle`; `safetensors` para arrays; el daemon no abre sockets.
