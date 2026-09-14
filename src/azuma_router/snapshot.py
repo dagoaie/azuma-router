@@ -3,6 +3,7 @@
 Complies with contract §3.7, §4.3, FR-25..FR-28, ADR-0009, ADR-0017.
 """
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -14,28 +15,21 @@ from pathlib import Path
 from safetensors.numpy import load_file, save_file
 
 from azuma_router.config import Config
-from azuma_router.errors import IncompatibleSnapshotError
+from azuma_router.errors import IncompatibleSnapshotError, SnapshotWriteError
 from azuma_router.quota import QuotaLedger
 from azuma_router.state import state_from_numpy, state_to_numpy
 from azuma_router.types import BanditState, SnapshotMeta
+from azuma_router.wal import fsync_directory
 
 
-def compute_config_sha256(config_path_or_str: str | Path | Config) -> str:
-    """Computes SHA-256 hash of configuration."""
-    if isinstance(config_path_or_str, Config):
-        # Hash string representation of arms and bandit hyperparams
-        content = json.dumps(
-            {
-                "arms": [arm.arm_id for arm in config_path_or_str.arms],
-                "bandit": config_path_or_str.bandit.seed,
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-        return hashlib.sha256(content).hexdigest()
-    path = Path(config_path_or_str)
-    if path.exists():
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    return ""
+def compute_config_sha256(config: Config) -> str:
+    """SHA-256 of the canonical JSON form of the whole validated config (P3-SF-4).
+
+    Hashing the dataclass rather than the TOML bytes keeps the hash stable across
+    comments and key order while still flagging any hyperparameter or arm change.
+    """
+    canonical = json.dumps(dataclasses.asdict(config), sort_keys=True, allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def write_snapshot(
@@ -49,7 +43,18 @@ def write_snapshot(
     Returns:
         (path_to_snapshot, total_bytes_written)
     """
-    root_dir = Path(dir_path)
+    try:
+        return _write_snapshot_files(Path(dir_path), state, ledger, meta)
+    except OSError as err:
+        raise SnapshotWriteError(f"snapshot write failed: {err}") from err
+
+
+def _write_snapshot_files(
+    root_dir: Path,
+    state: BanditState,
+    ledger: QuotaLedger,
+    meta: SnapshotMeta,
+) -> tuple[Path, int]:
     root_dir.mkdir(parents=True, exist_ok=True)
 
     tmp_dir = root_dir / "snapshot.tmp"
@@ -79,11 +84,7 @@ def write_snapshot(
     with json_path.open("rb") as f:
         os.fsync(f.fileno())
 
-    tmp_dir_fd = os.open(str(tmp_dir), os.O_RDONLY)
-    try:
-        os.fsync(tmp_dir_fd)
-    finally:
-        os.close(tmp_dir_fd)
+    fsync_directory(tmp_dir)
 
     # Atomic directory rename dance (ADR-0009)
     if old_dir.exists():
@@ -93,6 +94,7 @@ def write_snapshot(
         target_dir.rename(old_dir)
 
     tmp_dir.rename(target_dir)
+    fsync_directory(root_dir)  # the new snapshot/ entry is durable before old is dropped
 
     if old_dir.exists():
         shutil.rmtree(old_dir)

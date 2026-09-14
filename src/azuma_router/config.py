@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from azuma_router.errors import ConfigError
-from azuma_router.types import StaticConfig
+from azuma_router.types import MAX_INT31, StaticConfig
 
 
 @dataclass(frozen=True)
@@ -85,6 +85,9 @@ def _check_type(val: Any, expected_type: type | tuple[type, ...], field_path: st
         raise ConfigError(field_path, f"Expected {expected_type}, got {type(val).__name__}")
     if isinstance(val, float) and not math.isfinite(val):
         raise ConfigError(field_path, f"Float values must be finite, got {val}")
+    if isinstance(val, int | float) and abs(val) > MAX_INT31:
+        msg = f"Numeric values must lie within +-{MAX_INT31} to stay float32-safe, got {val}"
+        raise ConfigError(field_path, msg)
 
 
 def _req_dict_val(

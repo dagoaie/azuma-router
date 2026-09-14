@@ -7,30 +7,33 @@ import numpy as np
 import pytest
 
 from azuma_router.config import load_config, to_static_config
-from azuma_router.errors import IncompatibleSnapshotError
+from azuma_router.errors import IncompatibleSnapshotError, SnapshotWriteError
 from azuma_router.quota import QuotaLedger
-from azuma_router.snapshot import restore_snapshot, write_snapshot
+from azuma_router.snapshot import compute_config_sha256, restore_snapshot, write_snapshot
 from azuma_router.state import init_state
-from azuma_router.types import SnapshotMeta
+from azuma_router.types import BanditState, SnapshotMeta
+from conftest import load_fixture_config_with
 
 
-def test_snapshot_write_atomic_ac22(tmp_path: Path) -> None:
+def _snapshot_inputs() -> tuple[BanditState, QuotaLedger, SnapshotMeta]:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
-    state = init_state(cfg)
     ledger = QuotaLedger(cfg)
-    static = to_static_config(cfg)
-
     meta = SnapshotMeta(
         schema_version=1,
         state_version=42,
         featurizer_version=1,
         arm_ids=[arm.arm_id for arm in cfg.arms],
-        static=static,
+        static=to_static_config(cfg),
         seed=42,
         created_at="2026-09-14T12:00:00Z",
         ledger=ledger.dump(),
         config_sha256="hash123",
     )
+    return init_state(cfg), ledger, meta
+
+
+def test_snapshot_write_atomic_ac22(tmp_path: Path) -> None:
+    state, ledger, meta = _snapshot_inputs()
 
     path, n_bytes = write_snapshot(tmp_path, state, ledger, meta)
     assert path == tmp_path / "snapshot"
@@ -39,6 +42,15 @@ def test_snapshot_write_atomic_ac22(tmp_path: Path) -> None:
     assert (tmp_path / "snapshot" / "state.safetensors").exists()
     assert (tmp_path / "snapshot" / "state.json").exists()
     assert not (tmp_path / "snapshot.tmp").exists()
+
+
+def test_snapshot_write_io_failure_is_a_snapshot_write_error(tmp_path: Path) -> None:
+    """P3-MF-3: persistence faults are typed so the daemon can fail-stop instead of -32603."""
+    state, ledger, meta = _snapshot_inputs()
+    (tmp_path / "snapshot").write_text("not a directory")
+
+    with pytest.raises(SnapshotWriteError, match="snapshot"):
+        write_snapshot(tmp_path, state, ledger, meta)
 
 
 def test_restore_roundtrip_bitwise_ac24(tmp_path: Path) -> None:
@@ -163,3 +175,38 @@ def test_restore_config_sha256_mismatch_warning(
 
     captured = capsys.readouterr()
     assert "warning" in captured.err.lower() or "config_sha256_mismatch" in captured.err
+
+
+def test_snapshot_publish_fsyncs_the_parent_directory_after_the_renames(
+    tmp_path: Path, fsynced_inodes: list[int]
+) -> None:
+    """The directory rename is only durable once the parent directory entry is synced (P3-SF-3)."""
+    state, ledger, meta = _snapshot_inputs()
+    write_snapshot(tmp_path, state, ledger, meta)
+    write_snapshot(tmp_path, state, ledger, meta)  # second publish also replaces snapshot.old
+
+    parent_inode = tmp_path.stat().st_ino
+    assert fsynced_inodes.count(parent_inode) == 2
+
+
+@pytest.mark.parametrize(
+    ("old_line", "new_line"),
+    [
+        ("alpha = 1.0", "alpha = 1.5"),
+        ("pending_ttl_s = 3600", "pending_ttl_s = 7200"),
+        (
+            "units_per_1k_tokens = 0.0\nbarrier_mu = 0.5",
+            "units_per_1k_tokens = 0.0\nbarrier_mu = 0.9",
+        ),
+    ],
+)
+def test_config_sha256_covers_every_validated_field(
+    tmp_path: Path, old_line: str, new_line: str
+) -> None:
+    """A tweak to any hyperparameter or arm field changes the hash; nothing else does (P3-SF-4)."""
+    baseline = load_config(Path("fixtures/config/azuma.valid.toml"))
+    reloaded = load_fixture_config_with(tmp_path, **{old_line: old_line})
+    assert compute_config_sha256(reloaded) == compute_config_sha256(baseline)
+
+    changed = load_fixture_config_with(tmp_path, **{old_line: new_line})
+    assert compute_config_sha256(changed) != compute_config_sha256(baseline)

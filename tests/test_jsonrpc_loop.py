@@ -4,6 +4,8 @@ import io
 import json
 from pathlib import Path
 
+import pytest
+
 from azuma_router.config import load_config
 from azuma_router.daemon import Router, serve
 
@@ -95,3 +97,58 @@ def test_jsonrpc_loop_framing_and_errors(tmp_path: Path) -> None:
     assert stdout_notif.getvalue() == ""
 
     router.close()
+
+
+def _booted_router(tmp_path: Path) -> Router:
+    router = Router(
+        config=load_config("fixtures/config/azuma.valid.toml"),
+        snapshot_dir=tmp_path / ".azuma",
+        decision_log_path=tmp_path / "decisions.jsonl",
+    )
+    router.boot()
+    return router
+
+
+def _serve_lines(router: Router, *lines: str) -> list[str]:
+    stdout = io.StringIO()
+    serve(io.StringIO("".join(f"{line}\n" for line in lines)), stdout, io.StringIO(), router, False)
+    return stdout.getvalue().splitlines()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"jsonrpc":"2.0","id":NaN,"method":"health"}',
+        '{"jsonrpc":"2.0","id":Infinity,"method":"nope"}',
+        '{"jsonrpc":"2.0","id":1,"method":"select","params":{"request":{"input_tokens":-Infinity}}}',
+    ],
+)
+def test_non_standard_json_constants_are_a_parse_error_and_never_echoed(
+    tmp_path: Path, raw: str
+) -> None:
+    """P3-MF-4: NaN/Infinity are not JSON; they must neither kill the daemon nor reach stdout."""
+    router = _booted_router(tmp_path)
+
+    out = _serve_lines(router, raw, '{"jsonrpc":"2.0","id":7,"method":"health"}')
+
+    assert json.loads(out[0]) == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32700, "message": "Parse error"},
+    }
+    assert json.loads(out[1])["id"] == 7
+
+
+@pytest.mark.parametrize("bad_id", ["[1]", "{}", "1.5", "true"])
+def test_a_request_id_that_is_not_a_string_integer_or_null_is_an_invalid_request(
+    tmp_path: Path, bad_id: str
+) -> None:
+    router = _booted_router(tmp_path)
+
+    out = _serve_lines(router, f'{{"jsonrpc":"2.0","id":{bad_id},"method":"health"}}')
+
+    assert json.loads(out[0]) == {
+        "jsonrpc": "2.0",
+        "id": None,
+        "error": {"code": -32600, "message": "Invalid request", "data": {"reason": "invalid_id"}},
+    }

@@ -8,7 +8,7 @@
 ## Decisión
 - Arrays (`A`, `b`, `n_pulls`, `mask`, `rng_key`) → `state.safetensors`.
 - Metadatos → `state.json`: `state_version`, `schema_version`, `StaticConfig` completo, `featurizer_version`, ledger serializado (eventos vivos por ventana), `created_at`, `seed`.
-- Escritura: directorio temporal → `fsync` de ambos ficheros → `rename` atómico del directorio `snapshot.tmp` → `snapshot/` (dos ficheros bajo un mismo rename).
+- Escritura: directorio temporal → `fsync` de ambos ficheros y del temporal → `rename` atómico del directorio `snapshot.tmp` → `snapshot/` (dos ficheros bajo un mismo rename) → `fsync` del directorio padre, sin el cual el rename no es durable → borrar `snapshot.old/`.
 - Disparo: cada `max(N = 100 updates, T = 30 s)` — el primero que ocurra tras el mínimo — más snapshot en shutdown limpio.
 - `restore`: si `d`, `K_max`, `W_max` o `schema_version` difieren del binario → `IncompatibleSnapshotError`. Sin migración (política hard-cut). Recuperación explícita: borrar snapshot y re-entrenar, o exportar `DecisionLog` y re-aprender.
 - `DecisionLog` → JSONL independiente con rotación por tamaño; nunca dentro del snapshot.

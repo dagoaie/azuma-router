@@ -4,9 +4,10 @@
 
 ## Decisión
 - Cada `select` escribe **antes de responder** una línea `{"phase":"select", …}` (append + flush) y cada `report` aplicado una línea `{"phase":"report", …}`; expiraciones escriben `{"phase":"expire", …}`.
-- `PendingStore` = `dict[decision_id, Pending]` en memoria + orden de inserción (UUIDv7 es cronológico) para el barrido TTL. Se reconstruye al arrancar con replay del JSONL desde el `state_version` del snapshot: `select` sin `report`/`expire` posterior ⇒ pendiente.
+- `PendingStore` = `dict[decision_id, Pending]` en memoria + orden de inserción (UUIDv7 es cronológico) para el barrido TTL. Se reconstruye al arrancar con replay del JSONL (rotado + activo): todo `select` sin `report`/`expire` posterior ⇒ pendiente, sea cual sea su `state_version`; solo los `report` con `state_version > snapshot.state_version` se reaplican; el ledger se reconstruye de forma idempotente por `ledger_event_id`.
 - Barrido de TTL amortizado: al inicio de cada `select` y en cada `snapshot`. Sin hilos ni timers; el daemon es secuencial sobre stdio.
-- Rotación por tamaño (`decision_log_max_bytes`, default 256 MiB); el replay lee el fichero activo y el anterior.
+- Rotación por tamaño (`decision_log_max_bytes`, default 256 MiB), evaluada tras cualquier `append` y siempre precedida de snapshot; el replay y la comprobación «WAL con aprendizaje sin snapshot» leen el fichero activo y el anterior.
+- `applied_ids` es una LRU de 10 000: un `report` duplicado cuyo id ya fue desalojado responde `-32002` (desconocido), no `applied:false`; se acepta (el id ya no está en ningún segmento retenido).
 
 ## Porqué
 El JSONL ya existe para OPE; convertirlo en WAL cuesta un campo `phase`. El OPE prefiere las fases separadas (la decisión con su propensity queda registrada aunque el report nunca llegue). Single-thread elimina toda concurrencia.

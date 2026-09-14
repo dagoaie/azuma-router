@@ -47,13 +47,13 @@ Cada decisión cita el ADR que la fija; aquí se describe **cómo** se materiali
 `π = (1−ε)·softmax(score/τ) + ε/K_act` sobre activos; `arm = categorical(sub_key, log π)`; `rng_key` se avanza con `split` y vive en el estado. Garantiza `π_a ≥ ε/K_act` para IPS/DR. Con `K_act = 0` se usa `where(no_arm, 0, arm)` para no propagar NaN; el daemon lee `no_arm_available` antes que `arm`.
 
 ### D9 — Snapshot safetensors + JSON, publicado por rename de directorio (ADR-0009)
-`snapshot.tmp/` → fsync ficheros y directorio → `snapshot/ → snapshot.old/` → `snapshot.tmp/ → snapshot/` → borrar `snapshot.old/`. Al arrancar: `snapshot.old/` sin `snapshot/` ⇒ recuperar `old`; `snapshot.tmp/` residual ⇒ borrar. `restore` valida `SnapshotMeta` (schema_version, d, k_max, w_max, featurizer_version, arm_ids) **antes** de leer tensores; nunca migra (F10). `config_sha256` distinto con formas iguales ⇒ warning.
+`snapshot.tmp/` → fsync ficheros y directorio → `snapshot/ → snapshot.old/` → `snapshot.tmp/ → snapshot/` → fsync del directorio padre (la entrada `snapshot/` es durable) → borrar `snapshot.old/`. `config_sha256` = SHA-256 del JSON canónico (`sort_keys`) del `Config` validado completo. Al arrancar: `snapshot.old/` sin `snapshot/` ⇒ recuperar `old`; `snapshot.tmp/` residual ⇒ borrar. `restore` valida `SnapshotMeta` (schema_version, d, k_max, w_max, featurizer_version, arm_ids) **antes** de leer tensores; nunca migra (F10). `config_sha256` distinto con formas iguales ⇒ warning.
 
 ### D10 — Daemon JSON-RPC 2.0 sobre stdio, single-thread, sin batch (ADR-0010, ADR-0014)
 Framing por líneas, sin `Content-Length`. `Router` (dicts in/out, lanza `RpcError`) es la unidad testeable sin subprocess; `serve(stdin, stdout, stderr, router)` solo parsea, despacha y serializa. Códigos −32001…−32006 fijos. Señales ⇒ flag comprobada entre peticiones ⇒ snapshot ⇒ salida 0. Transportes alternativos: F1/F14 (nunca dual-path).
 
 ### D11 — Journal JSONL como WAL y dataset OPE (ADR-0011)
-Una línea por fase (`select`/`report`/`expire`), claves en orden fijo, `separators=(",", ":")`. `append = write + flush`, **sin** `fsync` por línea (costaría ~ms por decisión; se acepta perder la última línea ante corte de energía, no ante crash de proceso; el snapshot sí hace fsync) — F13. Rotación a `.1.jsonl` (máx. 1) tras `report`/`expire`.
+Una línea por fase (`select`/`report`/`expire`), claves en orden fijo, `separators=(",", ":")`. `append = write + flush`, **sin** `fsync` por línea (costaría ~ms por decisión; se acepta perder la última línea ante corte de energía, no ante crash de proceso; el snapshot sí hace fsync) — F13. Rotación a `.1.jsonl` (máx. 1) evaluada tras **cualquier** `append` (`select`/`report`/`expire`, incluido el `expire` de un `report` tardío y el barrido del RPC `snapshot`): snapshot primero, luego rename + fsync del directorio del journal; el fichero activo nuevo arranca con los `select` vivos. Rotar es responsabilidad de `snapshot()`, así ningún camino la olvida.
 
 ### D12 — API pública mínima (ADR-0012)
 `__all__ = [select, update, BanditState, StaticConfig, QuotaLedger, snapshot, restore]`. Todo lo demás es interno; el daemon es el consumidor canónico.
@@ -95,7 +95,7 @@ Dependencias solo hacia abajo: `daemon → {wal, snapshot, quota, reward, featur
 
 **`select`**: barrido de expirados → parse `request` (`-32602`) → `featurize` (`-32001`) → `allowed` (`-32602`) → `est_units` por brazo → `QuotaView(utilization(now), est, allowed)` → `select_jit` → si `no_arm_available` ⇒ `-32004` sin journal ni avance de estado → `ledger.record` → `uuid7()` → `log.append(select)` + flush → `pending[id] = Pending(...)` → `self.state = state'` → respuesta.
 
-**`report`**: validar (`-32602`) → buscar pendiente (`-32002` / duplicado si en `applied_ids`) → expirado (`-32003`) → `compute_reward` → `ledger.correct` → `state_version += 1` → `log.append(report, state_version)` → `self.state = update_jit(...)` → `pending.pop`, `applied_ids.add` → `maybe_snapshot()` → respuesta.
+**`report`**: validar (`-32602`) → buscar pendiente (`-32002` / duplicado si en `applied_ids`) → expirado (`-32003`, con `expire` journalizado y rotación evaluada) → `compute_reward` → `ledger.has_event` (ausente ⇒ `ledger_integrity_error`, salida 4 sin journal) → `log.append(report, state_version + 1)` → `ledger.correct` → `state_version += 1` → `self.state = update_jit(...)` → `pending.pop`, `applied_ids.add` → `maybe_snapshot()` → `rotate_if_needed()` → respuesta. El ledger retiene eventos `max(ventana más larga, pending_ttl_s)` para que `correct` siempre encuentre su evento.
 
 **`boot`**: `load_config` → `restore` o `init_state` (+ limpieza de `snapshot.tmp/`, recuperación de `snapshot.old/`) → `replay` (reconstruir pendientes; reaplicar reports posteriores al snapshot) → `warmup` → `ready` → `serve`.
 

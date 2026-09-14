@@ -36,6 +36,10 @@ class JournalWriteError(AzumaError):
     """Fatal failure writing or flushing to the decision journal (WAL)."""
 
 
+class SnapshotWriteError(AzumaError):
+    """Fatal failure publishing a snapshot; the last good snapshot stays in place (ADR-0009)."""
+
+
 class NumericalIntegrityError(AzumaError):
     """Non-finite score or numerical overflow detected (MF-4)."""
 
@@ -56,6 +60,14 @@ class LedgerEventDuplicateError(AzumaError):
         super().__init__(f"Ledger event {event_id} already recorded for arm {arm_id}")
         self.event_id = event_id
         self.arm_id = arm_id
+
+
+class InvalidRequestLineError(AzumaError):
+    """A stdin line is not a valid JSON-RPC 2.0 request; ``response`` is the error to write."""
+
+    def __init__(self, response: dict[str, Any]) -> None:
+        super().__init__(str(response["error"]["message"]))
+        self.response = response
 
 
 class RpcError(AzumaError):

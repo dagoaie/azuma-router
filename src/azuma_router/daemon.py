@@ -23,9 +23,12 @@ from azuma_router.errors import (
     AzumaError,
     ConfigError,
     InvalidContextError,
+    InvalidRequestLineError,
     JournalWriteError,
+    LedgerEventNotFoundError,
     NumericalIntegrityError,
     RpcError,
+    SnapshotWriteError,
 )
 from azuma_router.featurizer import FEATURIZER_VERSION, featurize
 from azuma_router.linucb import _compile_count, select_jit, update_jit
@@ -49,7 +52,7 @@ from azuma_router.types import (
     RoutingRequest,
     SnapshotMeta,
 )
-from azuma_router.wal import DecisionLog, PendingStore, replay_log
+from azuma_router.wal import DecisionLog, PendingStore, journal_state_version, replay_log
 
 
 def uuid7() -> str:
@@ -195,6 +198,9 @@ class Router:
 
     def boot(self) -> dict[str, Any]:
         """Initializes or restores state, replays WAL, warms up JIT, and marks ready (FR-30)."""
+        r_name = f"{self.decision_log_path.stem}.1{self.decision_log_path.suffix}"
+        rotated_path = self.decision_log_path.with_name(r_name)
+
         # 1. Restore snapshot or clean init
         res_snap = restore_snapshot(self.snapshot_dir, self.config)
         restored_state, restored_ledger, restored_meta = res_snap
@@ -205,31 +211,13 @@ class Router:
             self.state_version = restored_meta.state_version
             restored_from_snapshot = True
         else:
-            # Check inconsistent state: active WAL exists with state_version > 0 but no snapshot
-            if self.decision_log_path.exists() and not (self.snapshot_dir / "snapshot").exists():
-                with self.decision_log_path.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        if '"state_version":' in line:
-                            try:
-                                data = json.loads(line)
-                                if data.get("state_version", 0) > 0:
-                                    msg = (
-                                        "Active WAL exists with state_version > 0 "
-                                        "but no snapshot/ directory"
-                                    )
-                                    _log_event(sys.stderr, "error", "wal_inconsistent", error=msg)
-                                    sys.exit(3)
-                            except Exception:
-                                pass
-
+            self._refuse_learned_journal_without_snapshot(rotated_path)
             self.state = init_state(self.config)
             self.ledger = QuotaLedger(self.config)
             self.state_version = 0
             restored_from_snapshot = False
 
         # 2. Replay WAL
-        r_name = f"{self.decision_log_path.stem}.1{self.decision_log_path.suffix}"
-        rotated_path = self.decision_log_path.with_name(r_name)
         try:
             p_store, applied_reports, _applied_ids = replay_log(
                 active_path=self.decision_log_path,
@@ -297,9 +285,34 @@ class Router:
             )
         self.last_ts = now
 
-    def _sweep_expired(self) -> None:
-        """Sweeps expired pending decisions and writes expire WAL lines."""
-        now = self.clock()
+    def _refuse_learned_journal_without_snapshot(self, rotated_path: Path) -> None:
+        """A journaled update in any retained segment needs the snapshot it built on (P3-MF-2)."""
+        try:
+            learned_version = journal_state_version(self.decision_log_path, rotated_path)
+        except ValueError as err:
+            _log_event(sys.stderr, "error", "replay_failed", error=str(err))
+            sys.exit(3)
+        if learned_version > 0:
+            msg = f"WAL holds state_version {learned_version} but no snapshot/ directory exists"
+            _log_event(sys.stderr, "error", "wal_inconsistent", error=msg)
+            sys.exit(3)
+
+    def _journal_expire(self, decision_id: str, ts_select: float, now: float) -> None:
+        """Appends the single expire WAL line shape shared by every expiry path (P3-SF-1)."""
+        if self.dlog is None:
+            return
+        self.dlog.append(
+            {
+                "phase": "expire",
+                "decision_id": decision_id,
+                "ts": now,
+                "state_version": self.state_version,
+                "ts_select": ts_select,
+            }
+        )
+
+    def _sweep_expired(self, now: float) -> list[Pending]:
+        """Sweeps expired pending decisions and journals one expire line each."""
         self._check_clock_skew(now)
         expired = self.pending_store.sweep(now, self.config.bandit.pending_ttl_s)
         if expired:
@@ -312,24 +325,16 @@ class Router:
                 decision_ids=[p.decision_id for p in expired],
             )
         for p in expired:
-            if self.dlog is not None:
-                self.dlog.append(
-                    {
-                        "phase": "expire",
-                        "decision_id": p.decision_id,
-                        "ts": now,
-                        "state_version": self.state_version,
-                        "ts_select": p.ts_select,
-                    }
-                )
+            self._journal_expire(p.decision_id, p.ts_select, now)
+        return expired
 
     def select(self, params: dict[str, Any]) -> dict[str, Any]:
         """Orchestrates select step (FR-20, FR-31)."""
         if not self.ready:
             raise RpcError(-32005, "Daemon not ready")
 
-        self._sweep_expired()
         now = self.clock()
+        self._sweep_expired(now)
 
         # Parse request
         req_raw = params.get("request")
@@ -488,16 +493,8 @@ class Router:
                 self.pending_store.pop(d_id)
                 expired_at = pending.ts_select + float(self.config.bandit.pending_ttl_s)
                 self.pending_store.mark_expired(d_id, expired_at)
-                if self.dlog is not None:
-                    self.dlog.append(
-                        {
-                            "phase": "expire",
-                            "decision_id": d_id,
-                            "ts": now,
-                            "state_version": self.state_version,
-                            "ts_select": pending.ts_select,
-                        }
-                    )
+                self._journal_expire(d_id, pending.ts_select, now)
+                self._rotate_if_needed()
                 raise RpcError(
                     -32003,
                     f"Decision expired: {d_id}",
@@ -551,6 +548,10 @@ class Router:
             "reward": reward,
             "actual_units": actual_units,
         }
+        # A live pending must still own its ledger event; otherwise state is corrupt (P3-MF-1)
+        if not self.ledger.has_event(pending.ledger_event_id):
+            raise LedgerEventNotFoundError(pending.ledger_event_id, arm.arm_id)
+
         # FR-21 exact order: append WAL line FIRST (with next state_version)
         if self.dlog is not None:
             self.dlog.append(report_entry)
@@ -582,10 +583,14 @@ class Router:
             self.snapshot({})
 
     def _rotate_if_needed(self) -> None:
-        """Rotates the WAL once it exceeds max bytes, snapshotting first so no update is lost."""
+        """Snapshots once the WAL exceeds max bytes; snapshot() then rotates the journal."""
+        if self.dlog is not None and self.dlog.needs_rotation():
+            self.snapshot({})
+
+    def _rotate_after_snapshot(self) -> None:
+        """Rotates the WAL right after a snapshot, so no journaled update is ever dropped."""
         if self.dlog is None or not self.dlog.needs_rotation():
             return
-        self.snapshot({})
         carry_forward = [p.select_entry for p in self.pending_store.values()]
         bytes_before = self.dlog.path.stat().st_size
         self.dlog.rotate(carry_forward=carry_forward)
@@ -598,23 +603,12 @@ class Router:
         )
 
     def snapshot(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Barries expired and writes state snapshot (FR-25, FR-28)."""
+        """Journals expiries, writes the snapshot, then rotates the WAL if due (FR-25, FR-28)."""
         if not self.ready:
             raise RpcError(-32005, "Daemon not ready")
 
         now = self.clock()
-        expired = self.pending_store.sweep(now, self.config.bandit.pending_ttl_s)
-        for p in expired:
-            if self.dlog is not None:
-                self.dlog.append(
-                    {
-                        "phase": "expire",
-                        "decision_id": p.decision_id,
-                        "ts": now,
-                        "state_version": self.state_version,
-                        "ts_select": p.ts_select,
-                    }
-                )
+        expired = self._sweep_expired(now)
 
         meta = SnapshotMeta(
             schema_version=1,
@@ -631,6 +625,7 @@ class Router:
         target_path, n_bytes = write_snapshot(self.snapshot_dir, self.state, self.ledger, meta)
         self.updates_since_snapshot = 0
         self.last_snapshot_ts = now
+        self._rotate_after_snapshot()
 
         _log_event(
             sys.stderr,
@@ -674,9 +669,10 @@ class Router:
             "jit_compilations": dict(_compile_count),
         }
 
-    def close(self) -> int:
+    def close(self, *, with_snapshot: bool = True) -> int:
+        """Flushes and closes; the shutdown snapshot is skipped when state may be corrupt."""
         exit_code = 0
-        if self.ready:
+        if self.ready and with_snapshot:
             try:
                 self.snapshot({})
             except Exception as err:
@@ -742,17 +738,93 @@ def _dispatch_rpc_method(router: Router, method: str, params: dict[str, Any]) ->
     raise RpcError(-32601, f"Method not found: {method}")
 
 
-_FATAL_EVENT_NAMES: dict[type[AzumaError], str] = {
-    JournalWriteError: "journal_write_error",
-    NumericalIntegrityError: "numerical_integrity_error",
+# Fatal error -> (stderr event, whether a shutdown snapshot is still safe). A journal write
+# failure leaves the in-memory state consistent (WAL-first, nothing applied); the others do not
+# or cannot persist it (contract: numerical corruption is never snapshotted).
+_FATAL_POLICY: dict[type[AzumaError], tuple[str, bool]] = {
+    JournalWriteError: ("journal_write_error", True),
+    SnapshotWriteError: ("snapshot_write_error", False),
+    NumericalIntegrityError: ("numerical_integrity_error", False),
+    LedgerEventNotFoundError: ("ledger_integrity_error", False),
 }
+_FATAL_ERRORS = tuple(_FATAL_POLICY)
 
 
 def _exit_fatal(stderr: TextIO, router: Router, err: AzumaError, phase: str) -> NoReturn:
     """Logs a fatal integrity error, closes the router and exits 4 (ADR-0014)."""
-    _log_event(stderr, "error", _FATAL_EVENT_NAMES[type(err)], phase=phase, error=str(err))
-    code = router.close()
-    sys.exit(code or 4)
+    event_name, with_snapshot = _FATAL_POLICY[type(err)]
+    _log_event(stderr, "error", event_name, phase=phase, error=str(err))
+    router.close(with_snapshot=with_snapshot)
+    sys.exit(4)
+
+
+def _error_response(
+    req_id: str | int | None, code: int, message: str, data: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": req_id, "error": error}
+
+
+def _write_response(stdout: TextIO, response: dict[str, Any]) -> None:
+    """Every stdout line is strict JSON; a non-finite float anywhere is an integrity failure."""
+    try:
+        out = json.dumps(response, allow_nan=False) + "\n"
+    except ValueError as err:
+        msg = f"Non-finite float in response serialization: {err}"
+        raise NumericalIntegrityError(msg) from err
+    stdout.write(out)
+    stdout.flush()
+
+
+def _reject_json_constant(name: str) -> NoReturn:
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def _validate_request(line_str: str) -> dict[str, Any]:
+    """Parses one line as a JSON-RPC 2.0 request; rejects NaN/Infinity and bad ids (P3-MF-4)."""
+    try:
+        payload = json.loads(line_str, parse_constant=_reject_json_constant)
+    except ValueError as err:
+        raise InvalidRequestLineError(_error_response(None, -32700, "Parse error")) from err
+    if isinstance(payload, list):
+        msg = "Batch requests are not supported"
+        raise InvalidRequestLineError(_error_response(None, -32600, msg))
+    if not isinstance(payload, dict):
+        raise InvalidRequestLineError(_error_response(None, -32600, "Invalid request"))
+    req_id = payload.get("id")
+    if isinstance(req_id, bool) or not isinstance(req_id, str | int | None):
+        data = {"reason": "invalid_id"}
+        raise InvalidRequestLineError(_error_response(None, -32600, "Invalid request", data))
+    if payload.get("jsonrpc") != "2.0" or "method" not in payload:
+        raise InvalidRequestLineError(_error_response(req_id, -32600, "Invalid request"))
+    return payload
+
+
+def _handle_request(
+    stdout: TextIO, stderr: TextIO, router: Router, request: dict[str, Any]
+) -> None:
+    """Dispatches one validated request; fatal integrity errors terminate the process (exit 4)."""
+    req_id = request.get("id")
+    try:
+        result = _dispatch_rpc_method(router, request["method"], request.get("params", {}))
+        if req_id is not None:
+            _write_response(stdout, {"jsonrpc": "2.0", "id": req_id, "result": result})
+    except _FATAL_ERRORS as err:
+        _exit_fatal(stderr, router, err, phase="serve")
+    except RpcError as err:
+        if req_id is not None:
+            _write_response(stdout, _error_response(req_id, err.code, err.message, err.data))
+        else:
+            error_obj: dict[str, Any] = {"code": err.code, "message": err.message}
+            if err.data is not None:
+                error_obj["data"] = err.data
+            _log_event(stderr, "error", "rpc_notification_error", error=error_obj)
+    except Exception as err:
+        _log_event(stderr, "error", "unhandled_error", error=str(err))
+        if req_id is not None:
+            _write_response(stdout, _error_response(req_id, -32603, f"Internal error: {err}"))
 
 
 def serve(
@@ -770,98 +842,18 @@ def serve(
             if exit_on_eof:
                 sys.exit(code)
             break
-
         if is_too_long:
-            err_resp = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {
-                    "code": -32600,
-                    "message": "Invalid request",
-                    "data": {"reason": "line_too_long"},
-                },
-            }
-            stdout.write(json.dumps(err_resp) + "\n")
-            stdout.flush()
+            error = _error_response(None, -32600, "Invalid request", {"reason": "line_too_long"})
+            _write_response(stdout, error)
             continue
-
         if not line_str or not line_str.strip():
             continue
-
         try:
-            payload = json.loads(line_str.strip())
-        except Exception:
-            err_resp = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": "Parse error"},
-            }
-            stdout.write(json.dumps(err_resp) + "\n")
-            stdout.flush()
+            request = _validate_request(line_str.strip())
+        except InvalidRequestLineError as rejected:
+            _write_response(stdout, rejected.response)
             continue
-
-        if isinstance(payload, list):
-            err_resp = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32600, "message": "Batch requests are not supported"},
-            }
-            stdout.write(json.dumps(err_resp) + "\n")
-            stdout.flush()
-            continue
-
-        is_dict_payload = isinstance(payload, dict)
-        is_valid_rpc = is_dict_payload and payload.get("jsonrpc") == "2.0" and "method" in payload
-        if not is_valid_rpc:
-            err_resp = {
-                "jsonrpc": "2.0",
-                "id": payload.get("id") if isinstance(payload, dict) else None,
-                "error": {"code": -32600, "message": "Invalid request"},
-            }
-            stdout.write(json.dumps(err_resp) + "\n")
-            stdout.flush()
-            continue
-
-        req_id = payload.get("id")
-        method = payload["method"]
-        params = payload.get("params", {})
-
-        try:
-            result = _dispatch_rpc_method(router, method, params)
-
-            if req_id is not None:
-                resp = {"jsonrpc": "2.0", "id": req_id, "result": result}
-                try:
-                    out = json.dumps(resp, allow_nan=False) + "\n"
-                except ValueError as err:
-                    msg = f"Non-finite float in response serialization: {err}"
-                    raise NumericalIntegrityError(msg) from err
-                stdout.write(out)
-                stdout.flush()
-
-        except (JournalWriteError, NumericalIntegrityError) as err:
-            _exit_fatal(stderr, router, err, phase="serve")
-        except RpcError as err:
-            err_obj: dict[str, Any] = {"code": err.code, "message": err.message}
-            if err.data is not None:
-                err_obj["data"] = err.data
-
-            if req_id is not None:
-                resp = {"jsonrpc": "2.0", "id": req_id, "error": err_obj}
-                stdout.write(json.dumps(resp) + "\n")
-                stdout.flush()
-            else:
-                _log_event(stderr, "error", "rpc_notification_error", error=err_obj)
-        except Exception as err:
-            _log_event(stderr, "error", "unhandled_error", error=str(err))
-            if req_id is not None:
-                resp = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {"code": -32603, "message": f"Internal error: {err}"},
-                }
-                stdout.write(json.dumps(resp) + "\n")
-                stdout.flush()
+        _handle_request(stdout, stderr, router, request)
 
 
 def main() -> None:
@@ -887,7 +879,7 @@ def main() -> None:
 
     try:
         ready_params = router.boot()
-    except (JournalWriteError, NumericalIntegrityError) as err:
+    except _FATAL_ERRORS as err:
         _exit_fatal(sys.stderr, router, err, phase="boot")
     ready_notif = {"jsonrpc": "2.0", "method": "ready", "params": ready_params}
     sys.stdout.write(json.dumps(ready_notif) + "\n")

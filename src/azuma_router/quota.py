@@ -90,6 +90,10 @@ class QuotaLedger:
                     return
         raise LedgerEventNotFoundError(event_id, arm_id)
 
+    def _retention_s(self, arm: ArmConfig) -> float:
+        """Events stay correctable for the whole pending TTL, even once outside every window."""
+        return max(self._get_max_window_duration_s(arm), float(self.config.bandit.pending_ttl_s))
+
     def _get_max_window_duration_s(self, arm: ArmConfig) -> float:
         """Calculates max history window duration in seconds needed for pruning."""
         max_dur = 0.0
@@ -113,11 +117,11 @@ class QuotaLedger:
                 continue
 
             arm_events = self.events.get(arm.arm_id, deque())
-            max_dur = self._get_max_window_duration_s(arm)
+            retention_s = self._retention_s(arm)
 
-            # Prune events older than max_dur
-            if max_dur > 0:
-                cutoff = now - max_dur
+            # Prune events no window nor a live pending can still reference (P3-MF-1)
+            if retention_s > 0:
+                cutoff = now - retention_s
                 while arm_events and arm_events[0].ts < cutoff:
                     self._event_ids.discard(arm_events.popleft().event_id)
 

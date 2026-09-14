@@ -93,6 +93,14 @@ def test_decision_log_rotate_wraps_io_errors_in_journal_write_error(
         dlog.rotate(carry_forward=[])
 
 
+def test_decision_log_open_failure_is_a_journal_write_error(tmp_path: Path) -> None:
+    """P3-MF-3: an unopenable journal at boot is a typed fatal error, not a raw OSError."""
+    (tmp_path / "journal").write_text("a file where the journal directory should be")
+
+    with pytest.raises(JournalWriteError, match="WAL open failed"):
+        DecisionLog(tmp_path / "journal" / "decisions.jsonl")
+
+
 def test_pending_store_sweep() -> None:
     store = PendingStore()
     p1 = Pending(
@@ -153,3 +161,16 @@ def test_pending_store_keeps_at_most_ten_thousand_expired_ids_by_default() -> No
     assert not store.is_expired("id-0")
     assert store.is_expired("id-1")
     assert store.is_expired("id-10000")
+
+
+def test_rotation_fsyncs_the_journal_directory_after_the_rename(
+    tmp_path: Path, fsynced_inodes: list[int]
+) -> None:
+    """decisions.1.jsonl must survive a power cut right after rotation (P3-SF-3)."""
+    dlog = DecisionLog(path=tmp_path / "decisions.jsonl", max_bytes=1)
+    dlog.append({"phase": "select", "decision_id": "d1"})
+
+    dlog.rotate(carry_forward=[])
+
+    assert tmp_path.stat().st_ino in fsynced_inodes
+    dlog.close()

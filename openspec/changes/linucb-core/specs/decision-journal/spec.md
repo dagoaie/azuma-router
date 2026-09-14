@@ -33,7 +33,7 @@ Decisiones con `now − ts_select > pending_ttl_s` SHALL expirar en el barrido e
 - **THEN** las respuestas son `-32002` y `-32003` respectivamente (AC-21)
 
 ### Requirement: Replay en arranque
-Al arrancar, el daemon SHALL reconstruir el `PendingStore` leyendo el fichero rotado anterior y el activo, en orden, considerando solo líneas con `state_version ≥ snapshot.state_version`; una línea `report` con `state_version > snapshot.state_version` SHALL reaplicarse (`update` con la `x` y `arm_index` de su `select`). Una última línea corrupta SHALL descartarse; una línea corrupta no final SHALL abortar el arranque con código 3 (FR-23).
+Al arrancar, el daemon SHALL reconstruir el `PendingStore` leyendo el fichero rotado anterior y el activo, en orden: **toda** línea `select` retenida sin `report`/`expire` posterior es un pendiente vivo, sea cual sea su `state_version` (los `select` no lo avanzan), y el ledger se reconstruye de forma idempotente por `ledger_event_id`. Solo las líneas `report` con `state_version > snapshot.state_version` SHALL reaplicarse (`update` con la `x` y `arm_index` de su `select`). Un `report` sin `select` retenido ⇒ journal corrupto ⇒ salida 3. Una última línea corrupta SHALL descartarse; una línea corrupta no final SHALL abortar el arranque con código 3 (FR-23). Sin `snapshot/`, un `state_version > 0` en **cualquiera** de los dos segmentos ⇒ inconsistencia ⇒ salida 3.
 
 #### Scenario: pendiente reconstruida
 - **WHEN** se hace replay de un JSONL con un `select` sin `report`

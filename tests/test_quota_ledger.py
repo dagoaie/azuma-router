@@ -10,6 +10,7 @@ import pytest
 from azuma_router.config import load_config
 from azuma_router.errors import LedgerEventDuplicateError, LedgerEventNotFoundError
 from azuma_router.quota import QuotaLedger
+from conftest import load_fixture_config_with
 
 CODEX = "gpt-5-codex@openai-codex"
 
@@ -129,6 +130,21 @@ def test_pruned_events_are_forgotten_by_has_event() -> None:
     ledger.utilization(now=beyond_every_window)
     assert not ledger.has_event(1)
     assert ledger.events[CODEX] == deque()
+
+
+def test_events_outlive_every_window_until_the_pending_ttl_elapses(tmp_path: Path) -> None:
+    """A live pending may still be reported after its units left every window (P3-MF-1)."""
+    cfg = load_fixture_config_with(tmp_path, **{"pending_ttl_s = 3600": "pending_ttl_s = 5184000"})
+    ledger = QuotaLedger(cfg)
+    ledger.record(1, CODEX, 1.0, 1000.0)
+    beyond_every_window = 1000.0 + 30 * 86400.0
+
+    assert ledger.utilization(now=beyond_every_window)[0, 0] == 0.0
+    assert ledger.has_event(1)
+    ledger.correct(1, CODEX, 2.0)
+
+    ledger.utilization(now=1000.0 + 61 * 86400.0)
+    assert not ledger.has_event(1)
 
 
 def test_load_restores_event_ids_and_allocator() -> None:

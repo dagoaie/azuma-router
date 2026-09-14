@@ -2,6 +2,8 @@
 
 import io
 import json
+import math
+import shutil
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -13,8 +15,15 @@ import pytest
 from azuma_router import daemon as daemon_mod
 from azuma_router.config import load_config
 from azuma_router.daemon import Router, _read_line_bounded, main, serve
-from azuma_router.errors import JournalWriteError, NumericalIntegrityError, RpcError
+from azuma_router.errors import (
+    JournalWriteError,
+    NumericalIntegrityError,
+    RpcError,
+    SnapshotWriteError,
+)
+from azuma_router.quota import QuotaLedger
 from azuma_router.wal import PendingStore
+from conftest import load_fixture_config_with
 
 CODEX = "gpt-5-codex@openai-codex"
 REQUEST = {
@@ -754,6 +763,99 @@ def test_select_never_takes_the_cadence_snapshot_but_report_does(tmp_path: Path)
     router.close()
 
 
+def _booted_router_with_long_pending_ttl(tmp_path: Path, clock: list[float]) -> Router:
+    """Fixture config with pending_ttl_s longer than every quota window (2 x weekly)."""
+    cfg = load_fixture_config_with(tmp_path, **{"pending_ttl_s = 3600": "pending_ttl_s = 2000000"})
+    router = Router(
+        config=cfg,
+        snapshot_dir=tmp_path / ".azuma",
+        decision_log_path=tmp_path / "decisions.jsonl",
+        clock_fn=lambda: clock[0],
+    )
+    router.boot()
+    return router
+
+
+def test_report_after_units_left_every_window_but_within_ttl_is_applied(tmp_path: Path) -> None:
+    """P3-MF-1: pruning the quota windows must not break a still-live pending."""
+    clock = [1_000_000.0]
+    router = _booted_router_with_long_pending_ttl(tmp_path, clock)
+    d_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    clock[0] += 1_300_000.0  # past 2 x weekly, inside pending_ttl_s
+    assert _codex_utilization(router) == 0.0
+
+    result = router.report(_report_params(d_id))
+
+    assert result == {"applied": True, "reward": result["reward"], "state_version": 1}
+    assert router.report(_report_params(d_id))["reason"] == "duplicate"
+
+
+def _boot_exit_code(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> tuple[int, list[str]]:
+    router = Router(
+        config=load_config(Path("fixtures/config/azuma.valid.toml")),
+        snapshot_dir=tmp_path / ".azuma",
+        decision_log_path=tmp_path / "decisions.jsonl",
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        router.boot()
+    events = [json.loads(line)["event"] for line in capsys.readouterr().err.splitlines()]
+    return int(exit_info.value.code or 0), events
+
+
+def test_boot_refuses_learned_updates_in_the_rotated_wal_without_a_snapshot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P3-MF-2: the no-snapshot guard must scan the rotated segment, not only the active one."""
+    router = _booted_router(tmp_path)
+    router.report(_report_params(router.select({"request": REQUEST})["decision_id"]))
+    router.dlog.close()
+    (tmp_path / "decisions.jsonl").replace(tmp_path / "decisions.1.jsonl")
+    (tmp_path / "decisions.jsonl").write_text("")
+    shutil.rmtree(tmp_path / ".azuma", ignore_errors=True)
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "wal_inconsistent" in events
+
+
+def test_boot_does_not_swallow_a_corrupt_line_while_checking_for_a_missing_snapshot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "decisions.jsonl").write_text('{"state_version": 1, "phase": "repo\n{}\n')
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "replay_failed" in events
+
+
+def test_select_stays_finite_at_the_largest_accepted_quota_coefficients_and_tokens(
+    tmp_path: Path,
+) -> None:
+    """P3-MF-5: whatever load_config accepts must survive the float32 JAX boundary."""
+    largest = str(2**31 - 1)
+    cfg = load_fixture_config_with(
+        tmp_path,
+        **{
+            "units_per_request = 1.0": f"units_per_request = {largest}",
+            "units_per_1k_tokens = 0.0\nbarrier_mu = 0.5": (
+                f"units_per_1k_tokens = {largest}\nbarrier_mu = 0.5"
+            ),
+            "capacity = 300.0": f"capacity = {largest}",
+        },
+    )
+    router = Router(config=cfg, snapshot_dir=tmp_path / ".azuma", decision_log_path=tmp_path / "d")
+    router.boot()
+    request = {**REQUEST, "input_tokens": 2**31 - 1, "expected_output_tokens": 2**31 - 1}
+
+    result = router.select({"request": request})
+
+    assert result["arm"]["arm_id"] in {CODEX, "qwen3-coder@openrouter"}
+    assert router.report(_report_params(result["decision_id"]))["applied"] is True
+    assert math.isfinite(_codex_utilization(router))
+
+
 def test_report_on_an_evicted_expired_id_is_unknown_not_expired(tmp_path: Path) -> None:
     router = _booted_router(tmp_path)
     router.pending_store = PendingStore(max_lru=3)
@@ -818,6 +920,53 @@ def test_wal_rotation_carries_live_pendings_without_duplicating_quota(tmp_path: 
         assert restarted.report(_report_params(d_id))["applied"] is True
     assert _codex_utilization(restarted) == pytest.approx(utilization_before)
     restarted.close()
+
+
+def _expire_all_pendings(clock: list[float], ttl_s: float = 3600.0) -> None:
+    clock[0] += ttl_s + 1.0
+
+
+def test_report_on_an_expired_id_still_rotates_the_journal(tmp_path: Path) -> None:
+    """An expire line is an append like any other: it must trigger rotation (P3-SF-1)."""
+    clock = [1_700_000_000.0]
+    router = _booted_router(tmp_path, clock_fn=lambda: clock[0])
+    d_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    router.dlog.max_bytes = 1  # type: ignore[union-attr]
+    _expire_all_pendings(clock)
+
+    with pytest.raises(RpcError) as excinfo:
+        router.report(_report_params(d_id))
+    assert excinfo.value.code == -32003
+
+    rotated_path = tmp_path / "decisions.1.jsonl"
+    assert rotated_path.exists(), "the expire append pushed the journal past max_bytes"
+    assert d_id in _select_ids(rotated_path)
+    assert _select_ids(tmp_path / "decisions.jsonl") == set(), "an expired select is not carried"
+    router.close()
+
+    restarted = _booted_router(tmp_path, clock_fn=lambda: clock[0])
+    assert restarted.health({})["pending"] == 0
+    restarted.close()
+
+
+def test_snapshot_rpc_rotates_after_journaling_expiries(tmp_path: Path) -> None:
+    """The explicit snapshot RPC journals expiries and rotates like the implicit paths (P3-SF-1)."""
+    clock = [1_700_000_000.0]
+    router = _booted_router(tmp_path, clock_fn=lambda: clock[0])
+    d_ids = {
+        router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+        for _ in range(2)
+    }
+    router.dlog.max_bytes = 1  # type: ignore[union-attr]
+    _expire_all_pendings(clock)
+
+    assert router.snapshot({})["expired_pending"] == 2
+
+    rotated_path = tmp_path / "decisions.1.jsonl"
+    assert rotated_path.exists(), "the expire appends pushed the journal past max_bytes"
+    assert _select_ids(rotated_path) == d_ids
+    assert _select_ids(tmp_path / "decisions.jsonl") == set()
+    router.close()
 
 
 def test_wal_report_appended_after_rotation_is_reapplied_on_restart(tmp_path: Path) -> None:
@@ -918,7 +1067,12 @@ def test_select_non_finite_score_raises_numerical_integrity_error(
 
 # Journal Write Error Stdio Test
 @pytest.mark.parametrize(
-    "boot_error", [JournalWriteError("wal locked"), NumericalIntegrityError("nan")]
+    "boot_error",
+    [
+        JournalWriteError("wal locked"),
+        NumericalIntegrityError("nan"),
+        SnapshotWriteError("read-only filesystem"),
+    ],
 )
 def test_main_exits_4_when_boot_raises_a_fatal_integrity_error(
     monkeypatch: pytest.MonkeyPatch, boot_error: Exception
@@ -968,6 +1122,22 @@ def test_serve_exits_4_on_journal_write_error(
     assert [e["event"] for e in events if e["level"] == "error"] == ["journal_write_error"]
 
 
+def test_serve_exits_4_before_journaling_a_report_whose_ledger_event_is_missing(
+    tmp_path: Path,
+) -> None:
+    """A pending without its ledger event is corrupt state: fail-stop, never -32603 post-append."""
+    router = _booted_router(tmp_path)
+    d_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    router.ledger = QuotaLedger(router.config)
+
+    code, events = _serve_one_request(router, "report", _report_params(d_id))
+
+    assert code == 4
+    assert [e["event"] for e in events if e["level"] == "error"] == ["ledger_integrity_error"]
+    journal = _normalized_journal(tmp_path / "decisions.jsonl")
+    assert all('"report"' not in line for line in journal)
+
+
 def test_serve_exits_4_when_select_hits_a_non_finite_score(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -980,6 +1150,26 @@ def test_serve_exits_4_when_select_hits_a_non_finite_score(
     assert code == 4
     assert [e["event"] for e in events if e["level"] == "error"] == ["numerical_integrity_error"]
     assert "non_finite" not in capsys.readouterr().err, "serve owns the fatal log; no double log"
+    assert _snapshot_bytes(tmp_path) is None, "corrupt state must never be snapshotted"
+
+
+def test_serve_exits_4_when_the_rotation_snapshot_after_a_select_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """P3-MF-3: once select committed WAL/ledger/pending, a persistence fault cannot be -32603."""
+    router = _booted_router(tmp_path, max_bytes=1)
+
+    def failing_write_snapshot(*_args: object, **_kwargs: object) -> tuple[Path, int]:
+        raise SnapshotWriteError("snapshot write failed: disk full")
+
+    monkeypatch.setattr("azuma_router.daemon.write_snapshot", failing_write_snapshot)
+    capsys.readouterr()
+
+    code, events = _serve_one_request(router, "select", {"request": REQUEST})
+
+    assert code == 4
+    assert [e["event"] for e in events if e["level"] == "error"] == ["snapshot_write_error"]
+    assert "shutdown_snapshot_failed" not in capsys.readouterr().err
 
 
 def test_serve_exits_4_when_a_result_contains_a_non_finite_float(

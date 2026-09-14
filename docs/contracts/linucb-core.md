@@ -26,7 +26,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 
 ### 3.1 Configuración (ADR-0012, 0017)
 - **FR-01** Dado un `azuma.toml` válido, `load_config(path)` DEBE devolver un `Config` inmutable con brazos indexados por orden de aparición.
-- **FR-02** Dado un TOML con `arm_id` duplicado, sección obligatoria ausente, tipo incorrecto, `billing_mode = "subscription"` sin ventanas, o `billing_mode = "per_token"` con ventanas o `barrier_mu > 0`, DEBE lanzar `ConfigError` con la ruta del campo (`arms[2].windows[0].capacity`).
+- **FR-02** Dado un TOML con `arm_id` duplicado, sección obligatoria ausente, tipo incorrecto, valor numérico no finito o con `|v| > 2³¹ − 1` (fuera del rango seguro en float32), `billing_mode = "subscription"` sin ventanas, o `billing_mode = "per_token"` con ventanas o `barrier_mu > 0`, DEBE lanzar `ConfigError` con la ruta del campo (`arms[2].windows[0].capacity`).
 - **FR-03** `K = len(arms)` DEBE cumplir `1 ≤ K ≤ K_max`; `W = max(len(arm.windows))` DEBE cumplir `W ≤ W_max`.
 
 ### 3.2 Featurizer (ADR-0003, 0004, 0015)
@@ -46,6 +46,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 ### 3.4 Cuota y precio sombra (ADR-0005, 0006, 0011)
 - **FR-14** `QuotaLedger.record(arm_id, units, ts)` y `QuotaLedger.utilization(now) -> f32[K_max, W_max]` DEBEN dar `u = consumido_en_ventana / capacity`, con `RollingWindow` (últimos `duration_s`) y `FixedResetWindow` (desde el último `reset_anchor`).
 - **FR-15** `u ≥ 1.0` en cualquier ventana ⇒ el brazo DEBE quedar enmascarado en la `QuotaView` de ese `select`.
+- **FR-15b** El ledger DEBE retener cada evento al menos `max(duración de la ventana más larga del brazo, pending_ttl_s)` para que `correct` en `report` siempre encuentre su `ledger_event_id`; un `report` cuyo evento no existe es una violación de invariante ⇒ `ledger_integrity_error`, salida código 4 **antes** de escribir la línea `report`.
 - **FR-16** El consumo estimado (`est_units = units_per_request + units_per_1k_tokens·(input_tokens + expected_output_tokens)/1000`) DEBE anotarse en `select`; `report` DEBE reemplazarlo por el consumo real (`actual_*_tokens`) en el mismo evento del ledger (no sumar un segundo).
 - **FR-17** Brazos `per_token` DEBEN tener `shadow = 0` siempre.
 
@@ -61,7 +62,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 - **FR-24** `report` de `decision_id` desconocido ⇒ `-32002`; expirado ⇒ `-32003`.
 
 ### 3.7 Snapshot (ADR-0009, 0017)
-- **FR-25** `snapshot(state, ledger, meta, dir)` DEBE escribir `state.safetensors` + `state.json` en `<dir>/snapshot.tmp/`, `fsync` ambos, `fsync` del directorio, y `rename` a `<dir>/snapshot/` (reemplazando el anterior de forma atómica).
+- **FR-25** `snapshot(state, ledger, meta, dir)` DEBE escribir `state.safetensors` + `state.json` en `<dir>/snapshot.tmp/`, `fsync` ambos, `fsync` del directorio, `rename` a `<dir>/snapshot/` (reemplazando el anterior de forma atómica) y `fsync` del directorio padre antes de borrar `snapshot.old/`. Un `OSError` en cualquier paso ⇒ `snapshot_write_error`, salida código 4. `config_sha256` = SHA-256 del JSON canónico del `Config` validado completo.
 - **FR-26** `restore(dir, config) -> (state, ledger, meta)` DEBE lanzar `IncompatibleSnapshotError` si difiere cualquiera de: `schema_version`, `d`, `K_max`, `W_max`, `featurizer_version`, `arm_ids`. Nunca migrar.
 - **FR-27** `restore(snapshot(s)) == s` bitwise para todos los arrays.
 - **FR-28** El daemon DEBE hacer snapshot cuando `updates_since_snapshot ≥ 100` **o** `now − last_snapshot ≥ 30 s` (evaluado tras cada `report`) y en shutdown limpio (EOF en stdin o SIGTERM).
@@ -295,8 +296,8 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 
 | code | name | cuándo |
 |---|---|---|
-| −32700 | ParseError | línea no es JSON |
-| −32600 | InvalidRequest | falta `jsonrpc:"2.0"`/`method`, o batch |
+| −32700 | ParseError | línea no es JSON estricto (incluye `NaN`/`Infinity`); `id` siempre `null` |
+| −32600 | InvalidRequest | falta `jsonrpc:"2.0"`/`method`, batch, o `id` que no es string/entero/null (`data.reason = "invalid_id"`, se responde con `id: null`) |
 | −32601 | MethodNotFound | |
 | −32602 | InvalidParams | tipo/rango; `data.field` |
 | −32001 | InvalidContext | featurizer rechaza; `data.field`, `data.reason` |
@@ -325,13 +326,15 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 | Crash entre línea `select` y respuesta | Al arrancar, replay ve `select` sin `report`: pendiente; expirará o se reportará. |
 | Crash entre línea `report` y `update` aplicado | Replay reaplica `report` (línea existe, `state_version` del snapshot menor): `update` es idempotente por replay porque solo se reaplica si `state_version_line > snapshot.state_version`. |
 | Snapshot `.tmp` residual al arrancar | Se borra; se restaura `snapshot/` si existe. |
-| `snapshot/` ausente | Estado inicial (FR-07); `ready.restored_from_snapshot = false`; WAL existente se **rechaza** si contiene `state_version > 0` (inconsistencia) ⇒ salida código 3. |
+| `snapshot/` ausente | Estado inicial (FR-07); `ready.restored_from_snapshot = false`; WAL existente se **rechaza** si cualquiera de los dos segmentos (`decisions.jsonl`, `decisions.1.jsonl`) contiene `state_version > 0` (inconsistencia) ⇒ salida código 3; un segmento corrupto durante esa comprobación ⇒ `replay_failed`, salida 3. |
 | `arm_ids` del snapshot ≠ config | `IncompatibleSnapshotError`, salida código 3, mensaje con el diff de listas. |
 | `config_sha256` ≠ pero `arm_ids` y formas iguales (cambió `alpha`, pesos…) | Se acepta: hiperparámetros son valor, no forma; se anota `warning` en stderr. |
 | JSONL con línea corrupta al final (crash a mitad de escritura) | Replay descarta **solo la última línea** si no parsea; una línea corrupta no final ⇒ salida código 3. |
 | Rotación durante replay | No aplica: la rotación se evalúa tras cada `append` (`select`/`report`/`expire`) en servicio, nunca en replay; va precedida de snapshot y arrastra los `select` vivos al fichero nuevo. |
 | `NaN` en `A` (imposible por construcción) | `select` DEBE assert `jnp.isfinite(score).all()` fuera del JIT sobre `diagnostics`; fallo ⇒ excepción y salida código 4 (estado corrupto; no se hace snapshot). |
 | SIGTERM durante escritura de snapshot | El rename es atómico: o queda el anterior o el nuevo, nunca mixto. |
+| Fallo de E/S persistente (WAL abrir/escribir/rotar, snapshot) | `journal_write_error` ⇒ salida 4 **con** snapshot de cierre; `snapshot_write_error` ⇒ salida 4 sin reintentar el snapshot. Nunca se responde OK a una petición cuya línea no llegó al journal. |
+| Respuesta con `NaN`/`Infinity` (serialización) | Imposible por construcción (`allow_nan=False`); si ocurre ⇒ `numerical_integrity_error`, salida 4 sin snapshot. |
 | Reloj retrocede (NTP) | El ledger usa `time.time()`; un salto atrás puede rejuvenecer eventos; se acepta (ventanas se recuperan solas). Se registra `warning` si `now < last_ts − 1 s`. |
 | `select` en brazo cuyo `barrier_mu = 0` pero con ventana | `shadow = 0` pero `u ≥ 1` sigue enmascarando (FR-15). |
 

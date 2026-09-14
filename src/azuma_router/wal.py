@@ -4,6 +4,7 @@ Complies with contract §3.6, §4.4, FR-20..FR-24, ADR-0011, ADR-0016.
 """
 
 import json
+import os
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
@@ -21,14 +22,26 @@ from azuma_router.errors import JournalWriteError, LedgerEventNotFoundError
 from azuma_router.types import Pending
 
 
+def fsync_directory(directory: Path) -> None:
+    """Makes directory-entry changes (renames, new files) durable (P3-SF-3)."""
+    dir_fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 class DecisionLog:
     """Append-only JSONL log writer with max-byte rotation owned by Router (ADR-0011 / MF-2)."""
 
     def __init__(self, path: str | Path, max_bytes: int = 268435456) -> None:
         self.path = Path(path)
         self.max_bytes = max_bytes
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file: TextIOWrapper = self.path.open("a", encoding="utf-8")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.file: TextIOWrapper = self.path.open("a", encoding="utf-8")
+        except OSError as err:
+            raise JournalWriteError(f"WAL open failed: {err}") from err
 
     def append(self, entry: dict[str, Any]) -> None:
         """Appends a single JSONL line and flushes immediately (FR-20)."""
@@ -43,8 +56,11 @@ class DecisionLog:
 
     def needs_rotation(self) -> bool:
         """True once the active segment exceeds max_bytes; the file is always open, so it exists."""
-        self.file.flush()
-        return self.path.stat().st_size > self.max_bytes
+        try:
+            self.file.flush()
+            return self.path.stat().st_size > self.max_bytes
+        except OSError as err:
+            raise JournalWriteError(f"WAL stat failed: {err}") from err
 
     def rotate(self, carry_forward: Sequence[dict[str, Any]] = ()) -> None:
         """Moves the active segment to decisions.1.jsonl and re-journals live selects (FR-29)."""
@@ -61,6 +77,7 @@ class DecisionLog:
         rotated_path = self.path.with_name(f"{self.path.stem}.1{self.path.suffix}")
         self.path.replace(rotated_path)
         self.file = self.path.open("a", encoding="utf-8")
+        fsync_directory(self.path.parent)  # rename + new active segment durable (P3-SF-3)
         for entry in carry_forward:
             self.append(entry)
 
@@ -227,6 +244,19 @@ _PHASE_HANDLERS = {
     "report": _replay_report,
     "expire": _replay_expire,
 }
+
+
+def journal_state_version(active_path: Path, rotated_path: Path | None) -> int:
+    """Highest state_version journaled across both retained segments (0 when none).
+
+    Raises ValueError on a corrupt non-final line, exactly like replay."""
+    highest = 0
+    for fpath in (rotated_path, active_path):
+        if fpath is None or not fpath.exists():
+            continue
+        for entry in _read_journal(fpath):
+            highest = max(highest, int(entry.get("state_version", 0)))
+    return highest
 
 
 def replay_log(
