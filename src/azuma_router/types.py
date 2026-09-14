@@ -209,7 +209,7 @@ class Pending:
     est_units: float
     ledger_event_id: int
     state_version: int
-    raw_entry: dict[str, Any] | None = None
+    select_entry: dict[str, Any]  # journal line, carried forward verbatim on WAL rotation
 
 
 @dataclass(frozen=True)

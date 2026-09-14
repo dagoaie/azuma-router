@@ -57,7 +57,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 - **FR-20** Antes de responder a `select`, el daemon DEBE haber hecho `append + flush` de una línea `phase="select"` en el JSONL.
 - **FR-21** `report` para `decision_id` pendiente DEBE, en este orden: escribir `phase="report"`, corregir el ledger, aplicar `update`, mover a aplicado. Duplicado ⇒ `{"applied": false, "reason": "duplicate"}` sin escritura.
 - **FR-22** Pendientes con `now − ts_select > pending_ttl_s` DEBEN expirar en el barrido (inicio de `select` y `snapshot`): línea `phase="expire"`, sin `update`, consumo estimado del ledger se mantiene.
-- **FR-23** Al arrancar, el daemon DEBE reconstruir `PendingStore` por replay del JSONL (fichero activo + anterior rotado) considerando solo líneas con `state_version ≥ snapshot.state_version`.
+- **FR-23** Al arrancar, el daemon DEBE reconstruir `PendingStore` por replay del JSONL (fichero activo + anterior rotado): **toda** línea `select` retenida sin `report`/`expire` posterior es un pendiente vivo, sea cual sea su `state_version` (los `select` no lo avanzan); el ledger se reconstruye de forma idempotente por `ledger_event_id` (evento ya presente en el snapshot ⇒ no se re-registra). El filtro `state_version > snapshot.state_version` aplica solo a la reaplicación de líneas `report` (FR-24). Un `report` sin `select` retenido ⇒ journal corrupto ⇒ salida código 3.
 - **FR-24** `report` de `decision_id` desconocido ⇒ `-32002`; expirado ⇒ `-32003`.
 
 ### 3.7 Snapshot (ADR-0009, 0017)
@@ -174,7 +174,8 @@ RoutingRequest (frozen dataclass)             # ADR-0013
 
 Pending (frozen dataclass)                    # ADR-0016
   decision_id: str (UUIDv7), arm_index: int, x: f64[32], propensity: float,
-  ts_select: float, est_units: float, ledger_event_id: int, state_version: int
+  ts_select: float, est_units: float, ledger_event_id: int, state_version: int,
+  select_entry: dict          # línea `select` del journal, arrastrada íntegra en la rotación del WAL
 
 SnapshotMeta (frozen dataclass)               # ADR-0009
   schema_version: int (=1), state_version: int, featurizer_version: int (=1),
@@ -328,7 +329,7 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 | `arm_ids` del snapshot ≠ config | `IncompatibleSnapshotError`, salida código 3, mensaje con el diff de listas. |
 | `config_sha256` ≠ pero `arm_ids` y formas iguales (cambió `alpha`, pesos…) | Se acepta: hiperparámetros son valor, no forma; se anota `warning` en stderr. |
 | JSONL con línea corrupta al final (crash a mitad de escritura) | Replay descarta **solo la última línea** si no parsea; una línea corrupta no final ⇒ salida código 3. |
-| Rotación durante replay | No aplica: rotación solo tras escribir `report`/`expire`. |
+| Rotación durante replay | No aplica: la rotación se evalúa tras cada `append` (`select`/`report`/`expire`) en servicio, nunca en replay; va precedida de snapshot y arrastra los `select` vivos al fichero nuevo. |
 | `NaN` en `A` (imposible por construcción) | `select` DEBE assert `jnp.isfinite(score).all()` fuera del JIT sobre `diagnostics`; fallo ⇒ excepción y salida código 4 (estado corrupto; no se hace snapshot). |
 | SIGTERM durante escritura de snapshot | El rename es atómico: o queda el anterior o el nuevo, nunca mixto. |
 | Reloj retrocede (NTP) | El ledger usa `time.time()`; un salto atrás puede rejuvenecer eventos; se acepta (ventanas se recuperan solas). Se registra `warning` si `now < last_ts − 1 s`. |

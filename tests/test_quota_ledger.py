@@ -1,5 +1,6 @@
 """Tests for QuotaLedger and windowing calculations (T12 & T13)."""
 
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -7,7 +8,14 @@ import numpy as np
 import pytest
 
 from azuma_router.config import load_config
+from azuma_router.errors import LedgerEventDuplicateError, LedgerEventNotFoundError
 from azuma_router.quota import QuotaLedger
+
+CODEX = "gpt-5-codex@openai-codex"
+
+
+def _ledger() -> QuotaLedger:
+    return QuotaLedger(load_config(Path("fixtures/config/azuma.valid.toml")))
 
 
 def test_rolling_window_expiry_ac13() -> None:
@@ -18,7 +26,7 @@ def test_rolling_window_expiry_ac13() -> None:
     arm_id = cfg.arms[0].arm_id
     t0 = 1000.0
 
-    ledger.record(arm_id, 150.0, t0)
+    ledger.record(ledger.next_event_id(), arm_id, 150.0, t0)
     u_early = ledger.utilization(now=t0 + 100.0)
     np.testing.assert_allclose(u_early[0, 0], 0.5, rtol=1e-5)
 
@@ -41,7 +49,7 @@ def test_fixed_reset_weekly_ac13() -> None:
     week_s = 7 * 86400.0
     ts_before_reset = anchor_ts + week_s - 10.0
 
-    ledger.record(arm_id, 750.0, ts_before_reset)
+    ledger.record(ledger.next_event_id(), arm_id, 750.0, ts_before_reset)
     u_before = ledger.utilization(now=ts_before_reset + 1.0)
     np.testing.assert_allclose(u_before[0, 1], 0.5, rtol=1e-5)
 
@@ -56,7 +64,8 @@ def test_record_and_correct_inplace_ac15() -> None:
     ledger = QuotaLedger(cfg)
     arm_id = cfg.arms[0].arm_id
 
-    event_id = ledger.record(arm_id, 2.1, 1000.0)
+    event_id = ledger.next_event_id()
+    ledger.record(event_id, arm_id, 2.1, 1000.0)
     assert len(ledger.events[arm_id]) == 1
     assert ledger.events[arm_id][0].units == 2.1
 
@@ -78,8 +87,8 @@ def test_dump_and_load_roundtrip() -> None:
     ledger = QuotaLedger(cfg)
     arm_id = cfg.arms[0].arm_id
 
-    ledger.record(arm_id, 50.0, 1000.0)
-    ledger.record(arm_id, 100.0, 2000.0)
+    ledger.record(ledger.next_event_id(), arm_id, 50.0, 1000.0)
+    ledger.record(ledger.next_event_id(), arm_id, 100.0, 2000.0)
 
     dump_data = ledger.dump()
     restored_ledger = QuotaLedger.load(dump_data, cfg)
@@ -90,9 +99,43 @@ def test_dump_and_load_roundtrip() -> None:
 
 
 def test_ledger_event_not_found_error() -> None:
-    from azuma_router.errors import LedgerEventNotFoundError
-
-    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
-    ledger = QuotaLedger(cfg)
     with pytest.raises(LedgerEventNotFoundError):
-        ledger.correct(99999, "gpt-5-codex@openai-codex", 1.0)
+        _ledger().correct(99999, CODEX, 1.0)
+
+
+def test_event_ids_are_allocated_then_recorded_once() -> None:
+    ledger = _ledger()
+    event_id = ledger.next_event_id()
+    assert event_id == 1
+    assert not ledger.has_event(event_id)
+
+    ledger.record(event_id, CODEX, 2.0, 1000.0)
+    assert ledger.has_event(event_id)
+    with pytest.raises(LedgerEventDuplicateError):
+        ledger.record(event_id, CODEX, 2.0, 1000.0)
+    assert ledger.next_event_id() == 2
+
+
+def test_recording_a_replayed_event_id_advances_the_allocator() -> None:
+    ledger = _ledger()
+    ledger.record(7, CODEX, 1.0, 1000.0)  # id minted by a previous process, replayed from the WAL
+    assert ledger.next_event_id() == 8
+
+
+def test_pruned_events_are_forgotten_by_has_event() -> None:
+    ledger = _ledger()
+    ledger.record(1, CODEX, 1.0, 1000.0)
+    beyond_every_window = 1000.0 + 30 * 86400.0
+    ledger.utilization(now=beyond_every_window)
+    assert not ledger.has_event(1)
+    assert ledger.events[CODEX] == deque()
+
+
+def test_load_restores_event_ids_and_allocator() -> None:
+    ledger = _ledger()
+    ledger.record(ledger.next_event_id(), CODEX, 1.0, 1000.0)
+    ledger.record(ledger.next_event_id(), CODEX, 1.0, 1000.0)
+
+    restored = QuotaLedger.load(ledger.dump(), _ledger().config)
+    assert restored.has_event(1) and restored.has_event(2)
+    assert restored.next_event_id() == 3

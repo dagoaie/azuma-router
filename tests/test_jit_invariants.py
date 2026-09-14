@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import jax
+
 from azuma_router.config import load_config, to_static_config
 from azuma_router.linucb import _compile_count, select, select_jit, update, update_jit
 from azuma_router.state import init_state, make_quota_view, to_jax_array
@@ -34,6 +36,9 @@ def test_single_compilation_guarantee_ac12() -> None:
     static = to_static_config(cfg)
     state = init_state(cfg)
 
+    # Earlier tests may already have compiled for this static config; drop every
+    # cached executable so this test observes the compilations it triggers itself.
+    jax.clear_caches()
     start_select_count = _compile_count["select"]
     start_update_count = _compile_count["update"]
 
@@ -47,5 +52,5 @@ def test_single_compilation_guarantee_ac12() -> None:
         current_state, arm, _prop, _diag = select_jit(current_state, x_jax, qv, static)
         current_state = update_jit(current_state, x_jax, arm, 0.8, static)
 
-    assert _compile_count["select"] - start_select_count in (0, 1)
-    assert _compile_count["update"] - start_update_count in (0, 1)
+    assert _compile_count["select"] - start_select_count == 1
+    assert _compile_count["update"] - start_update_count == 1

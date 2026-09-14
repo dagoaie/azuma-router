@@ -14,12 +14,13 @@ import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, NoReturn, TextIO
 
 import numpy as np
 
 from azuma_router.config import Config, load_config, to_static_config
 from azuma_router.errors import (
+    AzumaError,
     ConfigError,
     InvalidContextError,
     JournalWriteError,
@@ -130,6 +131,9 @@ def _build_allowed_mask(allowed_list: Any, config: Config) -> list[bool]:
     return allowed_mask
 
 
+_MASKED_DIAGNOSTICS = ("score", "exploit", "bonus", "shadow_price")
+
+
 def _build_select_diagnostics(
     arms: tuple[Any, ...],
     diag: Any,
@@ -138,23 +142,14 @@ def _build_select_diagnostics(
 ) -> dict[str, Any]:
     policies = [float(diag.policy[i]) for i in range(len(arms))]
 
-    def _val_or_none(val: Any, active: bool) -> float | None:
-        return float(val) if active else None
+    def _masked_by_policy(values: Any) -> dict[str, float | None]:
+        """Per-arm values; arms the policy masked out (policy == 0) report null (§4.5)."""
+        return {
+            arm.arm_id: float(values[i]) if policies[i] > 0 else None for i, arm in enumerate(arms)
+        }
 
     return {
-        "score": {
-            arm.arm_id: _val_or_none(diag.score[i], policies[i] > 0) for i, arm in enumerate(arms)
-        },
-        "exploit": {
-            arm.arm_id: _val_or_none(diag.exploit[i], policies[i] > 0) for i, arm in enumerate(arms)
-        },
-        "bonus": {
-            arm.arm_id: _val_or_none(diag.bonus[i], policies[i] > 0) for i, arm in enumerate(arms)
-        },
-        "shadow_price": {
-            arm.arm_id: _val_or_none(diag.shadow_price[i], policies[i] > 0)
-            for i, arm in enumerate(arms)
-        },
+        **{name: _masked_by_policy(getattr(diag, name)) for name in _MASKED_DIAGNOSTICS},
         "policy": {arm.arm_id: policies[i] for i, arm in enumerate(arms)},
         "utilization": {
             arm.arm_id: {
@@ -380,9 +375,6 @@ class Router:
         active_scores = np.array(diag.score[:n_arms])
         policy_active = np.array(diag.policy[:n_arms]) > 0
         if not np.all(np.isfinite(np.where(policy_active, active_scores, 0.0))):
-            _log_event(
-                sys.stderr, "error", "non_finite_score", error="Non-finite score detected in select"
-            )
             raise NumericalIntegrityError("Non-finite score detected in select")
 
         if bool(diag.no_arm_available):
@@ -402,7 +394,7 @@ class Router:
         d_id = uuid7()
         est_u = float(est_units_arr[arm_i])
 
-        eid = self.ledger.peek_next_event_id()
+        eid = self.ledger.next_event_id()
 
         # Write WAL line select BEFORE mutating state or ledger (FR-20 / MF-2)
         util_dict = {
@@ -434,8 +426,7 @@ class Router:
             self.dlog.append(select_entry)
 
         # Mutate ledger and state only AFTER WAL append succeeds
-        rec_eid = self.ledger.record(chosen_arm.arm_id, est_u, now)
-        assert rec_eid == eid
+        self.ledger.record(eid, chosen_arm.arm_id, est_u, now)
         self.state = state_next
 
         pending = Pending(
@@ -447,10 +438,10 @@ class Router:
             est_units=est_u,
             ledger_event_id=eid,
             state_version=self.state_version,
-            raw_entry=select_entry,
+            select_entry=select_entry,
         )
         self.pending_store.put(pending)
-        self._maybe_snapshot()
+        self._rotate_if_needed()
 
         res = {
             "decision_id": d_id,
@@ -574,6 +565,7 @@ class Router:
         self.updates_since_snapshot += 1
 
         self._maybe_snapshot()
+        self._rotate_if_needed()
 
         return {
             "applied": True,
@@ -582,29 +574,28 @@ class Router:
         }
 
     def _maybe_snapshot(self) -> None:
+        """Takes the FR-28 cadence snapshot (by update count or elapsed time) after an update."""
         now = self.clock()
-        should_snapshot = (
-            self.updates_since_snapshot >= self.config.bandit.snapshot_every_updates
-            or (now - self.last_snapshot_ts) >= self.config.bandit.snapshot_every_s
-        )
-        needs_rot = self.dlog is not None and self.dlog.needs_rotation
-
-        if should_snapshot or needs_rot:
+        due_by_updates = self.updates_since_snapshot >= self.config.bandit.snapshot_every_updates
+        due_by_time = (now - self.last_snapshot_ts) >= self.config.bandit.snapshot_every_s
+        if due_by_updates or due_by_time:
             self.snapshot({})
 
-        if needs_rot and self.dlog is not None:
-            carry_forward = [
-                p.raw_entry for p in self.pending_store.values() if p.raw_entry is not None
-            ]
-            bytes_before = self.dlog.path.stat().st_size if self.dlog.path.exists() else 0
-            self.dlog.rotate(carry_forward=carry_forward)
-            _log_event(
-                sys.stderr,
-                "info",
-                "wal_rotated",
-                bytes=bytes_before,
-                carried_forward=len(carry_forward),
-            )
+    def _rotate_if_needed(self) -> None:
+        """Rotates the WAL once it exceeds max bytes, snapshotting first so no update is lost."""
+        if self.dlog is None or not self.dlog.needs_rotation():
+            return
+        self.snapshot({})
+        carry_forward = [p.select_entry for p in self.pending_store.values()]
+        bytes_before = self.dlog.path.stat().st_size
+        self.dlog.rotate(carry_forward=carry_forward)
+        _log_event(
+            sys.stderr,
+            "info",
+            "wal_rotated",
+            bytes=bytes_before,
+            carried_forward=len(carry_forward),
+        )
 
     def snapshot(self, params: dict[str, Any]) -> dict[str, Any]:
         """Barries expired and writes state snapshot (FR-25, FR-28)."""
@@ -751,6 +742,19 @@ def _dispatch_rpc_method(router: Router, method: str, params: dict[str, Any]) ->
     raise RpcError(-32601, f"Method not found: {method}")
 
 
+_FATAL_EVENT_NAMES: dict[type[AzumaError], str] = {
+    JournalWriteError: "journal_write_error",
+    NumericalIntegrityError: "numerical_integrity_error",
+}
+
+
+def _exit_fatal(stderr: TextIO, router: Router, err: AzumaError, phase: str) -> NoReturn:
+    """Logs a fatal integrity error, closes the router and exits 4 (ADR-0014)."""
+    _log_event(stderr, "error", _FATAL_EVENT_NAMES[type(err)], phase=phase, error=str(err))
+    code = router.close()
+    sys.exit(code or 4)
+
+
 def serve(
     stdin: TextIO,
     stdout: TextIO,
@@ -836,9 +840,7 @@ def serve(
                 stdout.flush()
 
         except (JournalWriteError, NumericalIntegrityError) as err:
-            _log_event(stderr, "error", type(err).__name__.lower(), error=str(err))
-            code = router.close()
-            sys.exit(code or 4)
+            _exit_fatal(stderr, router, err, phase="serve")
         except RpcError as err:
             err_obj: dict[str, Any] = {"code": err.code, "message": err.message}
             if err.data is not None:
@@ -883,7 +885,10 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    ready_params = router.boot()
+    try:
+        ready_params = router.boot()
+    except (JournalWriteError, NumericalIntegrityError) as err:
+        _exit_fatal(sys.stderr, router, err, phase="boot")
     ready_notif = {"jsonrpc": "2.0", "method": "ready", "params": ready_params}
     sys.stdout.write(json.dumps(ready_notif) + "\n")
     sys.stdout.flush()

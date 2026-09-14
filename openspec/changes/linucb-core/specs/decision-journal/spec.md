@@ -44,8 +44,8 @@ Al arrancar, el daemon SHALL reconstruir el `PendingStore` leyendo el fichero ro
 - **THEN** el replay la descarta y continúa; si la línea corrupta no es la última, lanza error
 
 ### Requirement: Rotación acotada
-`DecisionLog` SHALL rotar el fichero activo a `decisions.1.jsonl` (conservando como máximo un fichero rotado) cuando su tamaño supere `decision_log_max_bytes`, evaluado solo tras escribir `report` o `expire`.
+`DecisionLog` SHALL rotar el fichero activo a `decisions.1.jsonl` (conservando como máximo un fichero rotado) cuando su tamaño supere `decision_log_max_bytes`, evaluado tras escribir cualquier línea (`select`, `report` o `expire`). Antes de rotar, el daemon SHALL escribir un snapshot (ningún `update` queda solo en el fichero rotado) y el fichero activo nuevo SHALL comenzar con las líneas `select` de todos los pendientes vivos, arrastradas íntegras.
 
 #### Scenario: rotación
-- **WHEN** el fichero supera `max_bytes` tras una línea `report`
-- **THEN** existe `decisions.1.jsonl` con el contenido anterior y el activo comienza vacío
+- **WHEN** el fichero supera `max_bytes` tras una línea `select` o `report`
+- **THEN** existe `decisions.1.jsonl` con el contenido anterior, hay un snapshot con el `state_version` actual y el activo contiene solo las líneas `select` de los pendientes vivos

@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 
 from azuma_router.config import ArmConfig, Config
-from azuma_router.errors import LedgerEventNotFoundError
+from azuma_router.errors import LedgerEventDuplicateError, LedgerEventNotFoundError
 
 
 @dataclass
@@ -58,35 +58,28 @@ class QuotaLedger:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._next_event_id: int = 1
+        self._event_ids: set[int] = set()
         self.events: dict[str, deque[LedgerEvent]] = {arm.arm_id: deque() for arm in config.arms}
 
-    def peek_next_event_id(self) -> int:
-        """Returns the next event_id that will be assigned by record."""
-        return self._next_event_id
+    def next_event_id(self) -> int:
+        """Allocates the id for the next event; the caller journals it before calling record."""
+        event_id = self._next_event_id
+        self._next_event_id += 1
+        return event_id
 
     def has_event(self, event_id: int) -> bool:
-        """Returns True if event_id is present in active ledger events."""
-        for ev_queue in self.events.values():
-            for ev in ev_queue:
-                if ev.event_id == event_id:
-                    return True
-        return False
+        """Returns True if event_id is present in active (unpruned) ledger events."""
+        return event_id in self._event_ids
 
-    def record(self, arm_id: str, units: float, ts: float, event_id: int | None = None) -> int:
-        """Records an estimated or final consumption event."""
-        if arm_id not in self.events:
-            self.events[arm_id] = deque()
-
-        if event_id is None:
-            eid = self._next_event_id
-            self._next_event_id += 1
-        else:
-            eid = event_id
-            self._next_event_id = max(self._next_event_id, eid + 1)
-
-        ev = LedgerEvent(event_id=eid, arm_id=arm_id, units=units, ts=ts)
-        self.events[arm_id].append(ev)
-        return eid
+    def record(self, event_id: int, arm_id: str, units: float, ts: float) -> None:
+        """Records an estimated consumption event under an id minted by next_event_id or a WAL."""
+        if event_id in self._event_ids:
+            raise LedgerEventDuplicateError(event_id, arm_id)
+        self._event_ids.add(event_id)
+        self._next_event_id = max(self._next_event_id, event_id + 1)
+        self.events.setdefault(arm_id, deque()).append(
+            LedgerEvent(event_id=event_id, arm_id=arm_id, units=units, ts=ts)
+        )
 
     def correct(self, event_id: int, arm_id: str, actual_units: float) -> None:
         """Corrects an existing ledger event in-place with actual observed units (FR-16)."""
@@ -126,7 +119,7 @@ class QuotaLedger:
             if max_dur > 0:
                 cutoff = now - max_dur
                 while arm_events and arm_events[0].ts < cutoff:
-                    arm_events.popleft()
+                    self._event_ids.discard(arm_events.popleft().event_id)
 
             for j, w in enumerate(arm.windows):
                 if j >= w_max:
@@ -175,20 +168,10 @@ class QuotaLedger:
     def load(cls, data: dict[str, Any], config: Config) -> "QuotaLedger":
         """Restores QuotaLedger state from snapshot dump data."""
         ledger = cls(config)
-        ledger._next_event_id = data.get("next_event_id", 1)
-        raw_events = data.get("events", {})
-
-        for arm_id, ev_list in raw_events.items():
-            queue: deque[LedgerEvent] = deque()
+        for ev_list in data["events"].values():
             for item in ev_list:
-                queue.append(
-                    LedgerEvent(
-                        event_id=item["event_id"],
-                        arm_id=item["arm_id"],
-                        units=float(item["units"]),
-                        ts=float(item["ts"]),
-                    )
+                ledger.record(
+                    int(item["event_id"]), item["arm_id"], float(item["units"]), float(item["ts"])
                 )
-            ledger.events[arm_id] = queue
-
+        ledger._next_event_id = max(ledger._next_event_id, int(data["next_event_id"]))
         return ledger

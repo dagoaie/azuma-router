@@ -267,8 +267,11 @@ def test_routing_request_integer_bounds_property(
     agent_depth: int,
     diff_lines: int | None,
 ) -> None:
-    try:
-        req = RoutingRequest(
+    values = [input_tokens, agent_depth, expected_output_tokens, diff_lines]
+    in_bounds = all(v is None or 0 <= v <= 2**31 - 1 for v in values)
+
+    def build() -> RoutingRequest:
+        return RoutingRequest(
             task_kind=TaskKind.CODE_EDIT,
             input_tokens=input_tokens,
             expected_output_tokens=expected_output_tokens,
@@ -279,11 +282,9 @@ def test_routing_request_integer_bounds_property(
             diff_lines=diff_lines,
             priority=Priority.NORMAL,
         )
-        assert 0 <= req.input_tokens <= 2**31 - 1
-        assert 0 <= req.agent_depth <= 2**31 - 1
-        if req.expected_output_tokens is not None:
-            assert 0 <= req.expected_output_tokens <= 2**31 - 1
-        if req.diff_lines is not None:
-            assert 0 <= req.diff_lines <= 2**31 - 1
-    except Exception as exc:
-        assert type(exc).__name__ in ("InvalidContextError", "RpcError")
+
+    if in_bounds:
+        assert build().input_tokens == input_tokens
+    else:
+        with pytest.raises(InvalidContextError):
+            build()

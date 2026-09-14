@@ -5,7 +5,8 @@ Complies with contract §3.6, §4.4, FR-20..FR-24, ADR-0011, ADR-0016.
 
 import json
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field
 from io import TextIOWrapper
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
     from azuma_router.quota import QuotaLedger
 
 from azuma_router.config import Config
-from azuma_router.errors import JournalWriteError
+from azuma_router.errors import JournalWriteError, LedgerEventNotFoundError
 from azuma_router.types import Pending
 
 
@@ -40,30 +41,28 @@ class DecisionLog:
         except Exception as err:
             raise JournalWriteError(f"WAL append failed: {err}") from err
 
-    @property
     def needs_rotation(self) -> bool:
-        """True if current WAL size exceeds max_bytes (MF-2)."""
-        if not self.path.exists():
-            return False
+        """True once the active segment exceeds max_bytes; the file is always open, so it exists."""
         self.file.flush()
         return self.path.stat().st_size > self.max_bytes
 
     def rotate(self, carry_forward: Sequence[dict[str, Any]] = ()) -> None:
-        """Rotates file to decisions.1.jsonl and writes carried-forward entries (MF-2)."""
+        """Moves the active segment to decisions.1.jsonl and re-journals live selects (FR-29)."""
+        try:
+            self._rotate_files(carry_forward)
+        except JournalWriteError:
+            raise
+        except Exception as err:
+            raise JournalWriteError(f"WAL rotation failed: {err}") from err
+
+    def _rotate_files(self, carry_forward: Sequence[dict[str, Any]]) -> None:
         self.file.flush()
         self.file.close()
-
         rotated_path = self.path.with_name(f"{self.path.stem}.1{self.path.suffix}")
-        if rotated_path.exists():
-            rotated_path.unlink()
-        if self.path.exists():
-            self.path.replace(rotated_path)
-
+        self.path.replace(rotated_path)
         self.file = self.path.open("a", encoding="utf-8")
         for entry in carry_forward:
-            line = json.dumps(entry, separators=(",", ":"), allow_nan=False) + "\n"
-            self.file.write(line)
-        self.file.flush()
+            self.append(entry)
 
     def close(self) -> None:
         if not self.file.closed:
@@ -136,6 +135,100 @@ class PendingStore:
         return decision_id in self._pending
 
 
+@dataclass
+class _ReplayState:
+    """Mutable accumulator threaded through the per-phase replay handlers."""
+
+    snapshot_state_version: int
+    ledger: "QuotaLedger | None"
+    pending_ttl_s: float
+    pending_store: PendingStore = field(default_factory=PendingStore)
+    applied_reports: list[tuple[int, np.ndarray, int, float]] = field(default_factory=list)
+    applied_ids: set[str] = field(default_factory=set)
+    select_by_id: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+def _read_journal(fpath: Path) -> Iterator[dict[str, Any]]:
+    """Yields parsed lines; a corrupt final line is a crash artefact and is discarded (FR-24)."""
+    with fpath.open("r", encoding="utf-8") as f:
+        lines = f.readlines()
+    for idx, line in enumerate(lines):
+        line_str = line.strip()
+        if not line_str:
+            continue
+        try:
+            yield json.loads(line_str)
+        except json.JSONDecodeError as err:
+            if idx == len(lines) - 1:
+                return
+            raise ValueError(f"WAL corrupt at line {idx + 1} in {fpath}: {err}") from err
+
+
+def _replay_select(entry: dict[str, Any], rs: _ReplayState) -> None:
+    """Every retained select without a later report/expire is a live pending, whatever its
+    state_version: selects never advance it (FR-23). Ledger replay is idempotent by event id."""
+    d_id = entry["decision_id"]
+    if "ledger_event_id" not in entry:
+        raise ValueError(f"Missing ledger_event_id in select line for decision {d_id}")
+    eid = int(entry["ledger_event_id"])
+    rs.select_by_id[d_id] = entry
+    if rs.ledger is not None and not rs.ledger.has_event(eid):
+        rs.ledger.record(eid, entry["arm_id"], float(entry["est_units"]), float(entry["ts"]))
+    rs.pending_store.put(
+        Pending(
+            decision_id=d_id,
+            arm_index=entry["arm_index"],
+            x=entry["x"],
+            propensity=entry["propensity"],
+            ts_select=entry["ts"],
+            est_units=entry["est_units"],
+            ledger_event_id=eid,
+            state_version=entry["state_version"],
+            select_entry=entry,
+        )
+    )
+
+
+def _replay_report(entry: dict[str, Any], rs: _ReplayState) -> None:
+    """Closes the pending; re-applies ledger correction and update only past the snapshot (D15)."""
+    d_id = entry["decision_id"]
+    select_entry = rs.select_by_id.get(d_id)
+    if select_entry is None:
+        raise ValueError(f"WAL report for decision {d_id} has no retained select line")
+    rs.pending_store.pop(d_id)
+    rs.pending_store.mark_applied(d_id)
+    rs.applied_ids.add(d_id)
+    state_version = int(entry["state_version"])
+    if state_version <= rs.snapshot_state_version:
+        return
+    if rs.ledger is not None:
+        try:
+            rs.ledger.correct(
+                int(select_entry["ledger_event_id"]),
+                select_entry["arm_id"],
+                float(entry["actual_units"]),
+            )
+        except LedgerEventNotFoundError as err:
+            raise ValueError(f"WAL report for decision {d_id}: {err}") from err
+    x_arr = np.array(select_entry["x"], dtype=np.float64)
+    rs.applied_reports.append(
+        (state_version, x_arr, int(select_entry["arm_index"]), float(entry["reward"]))
+    )
+
+
+def _replay_expire(entry: dict[str, Any], rs: _ReplayState) -> None:
+    d_id = entry["decision_id"]
+    rs.pending_store.pop(d_id)
+    rs.pending_store.mark_expired(d_id, float(entry["ts_select"]) + rs.pending_ttl_s)
+
+
+_PHASE_HANDLERS = {
+    "select": _replay_select,
+    "report": _replay_report,
+    "expire": _replay_expire,
+}
+
+
 def replay_log(
     active_path: Path,
     rotated_path: Path | None,
@@ -143,93 +236,15 @@ def replay_log(
     config: Config,
     ledger: "QuotaLedger | None" = None,
 ) -> tuple[PendingStore, list[tuple[int, np.ndarray, int, float]], set[str]]:
-    """Replays JSONL WAL files in order to restore PendingStore and unapplied updates (FR-23)."""
-    pending_store = PendingStore()
-    applied_reports: list[tuple[int, np.ndarray, int, float]] = []
-    applied_ids: set[str] = set()
-    select_by_id: dict[str, dict[str, Any]] = {}
-    pending_event_ids: dict[str, int] = {}
-
-    files_to_read: list[Path] = []
-    if rotated_path and rotated_path.exists():
-        files_to_read.append(rotated_path)
-    if active_path.exists():
-        files_to_read.append(active_path)
-
-    for fpath in files_to_read:
-        with fpath.open("r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        for idx, line in enumerate(lines):
-            line_str = line.strip()
-            if not line_str:
-                continue
-
-            try:
-                entry = json.loads(line_str)
-            except Exception as err:
-                is_last_line = idx == len(lines) - 1
-                if is_last_line:
-                    # Corrupt tail at EOF -> discard and stop reading this file
-                    break
-                msg = f"WAL corrupt at line {idx + 1} in {fpath}: {err}"
-                raise ValueError(msg) from err
-
-            phase = entry.get("phase")
-            d_id = entry.get("decision_id", "")
-            s_ver = entry.get("state_version", 0)
-
-            if phase == "select":
-                if "ledger_event_id" not in entry:
-                    raise ValueError(f"Missing ledger_event_id in select line for decision {d_id}")
-                eid = int(entry["ledger_event_id"])
-                select_by_id[d_id] = entry
-                if s_ver >= snapshot_state_version:
-                    if ledger is not None and not ledger.has_event(eid):
-                        ledger.record(
-                            entry["arm_id"],
-                            float(entry.get("est_units", 0.0)),
-                            float(entry["ts"]),
-                            event_id=eid,
-                        )
-                    pending_event_ids[d_id] = eid
-                    pending = Pending(
-                        decision_id=d_id,
-                        arm_index=entry["arm_index"],
-                        x=entry["x"],
-                        propensity=entry["propensity"],
-                        ts_select=entry["ts"],
-                        est_units=entry.get("est_units", 0.0),
-                        ledger_event_id=eid,
-                        state_version=s_ver,
-                        raw_entry=entry,
-                    )
-                    pending_store.put(pending)
-
-            elif phase == "report":
-                pending_store.pop(d_id)
-                applied_ids.add(d_id)
-                pending_store.mark_applied(d_id)
-                eid = pending_event_ids.pop(d_id, 0)
-                if eid == 0 and d_id in select_by_id:
-                    eid = int(select_by_id[d_id].get("ledger_event_id", 0))
-                if ledger is not None and eid > 0:
-                    arm_id = select_by_id[d_id]["arm_id"] if d_id in select_by_id else ""
-                    actual_u = float(entry.get("actual_units", 0.0))
-                    if arm_id and ledger.has_event(eid):
-                        ledger.correct(eid, arm_id, actual_u)
-                if s_ver > snapshot_state_version:
-                    if d_id in select_by_id:
-                        s_entry = select_by_id[d_id]
-                        x_arr = np.array(s_entry["x"], dtype=np.float64)
-                        arm_idx = s_entry["arm_index"]
-                        reward = float(entry["reward"])
-                        applied_reports.append((s_ver, x_arr, arm_idx, reward))
-
-            elif phase == "expire":
-                pending_store.pop(d_id)
-                pending_event_ids.pop(d_id, None)
-                ts_select = float(entry.get("ts_select", entry.get("ts", 0.0)))
-                pending_store.mark_expired(d_id, ts_select + config.bandit.pending_ttl_s)
-
-    return pending_store, applied_reports, applied_ids
+    """Replays the rotated then the active journal to rebuild PendingStore, the ledger events
+    not yet in the snapshot, and the updates to re-apply (FR-23)."""
+    rs = _ReplayState(snapshot_state_version, ledger, config.bandit.pending_ttl_s)
+    retained = [p for p in (rotated_path, active_path) if p is not None and p.exists()]
+    for fpath in retained:
+        for entry in _read_journal(fpath):
+            phase = str(entry.get("phase"))
+            handler = _PHASE_HANDLERS.get(phase)
+            if handler is None:
+                raise ValueError(f"WAL line with unknown phase {phase!r} in {fpath}")
+            handler(entry, rs)
+    return rs.pending_store, rs.applied_reports, rs.applied_ids

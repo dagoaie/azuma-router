@@ -48,7 +48,7 @@ def test_restore_roundtrip_bitwise_ac24(tmp_path: Path) -> None:
     static = to_static_config(cfg)
 
     arm_id = cfg.arms[0].arm_id
-    ledger.record(arm_id, 10.0, time.time())
+    ledger.record(ledger.next_event_id(), arm_id, 10.0, time.time())
 
     meta = SnapshotMeta(
         schema_version=1,

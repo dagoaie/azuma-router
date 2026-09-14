@@ -2,14 +2,103 @@
 
 import io
 import json
+import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 
+from azuma_router import daemon as daemon_mod
 from azuma_router.config import load_config
-from azuma_router.daemon import Router, _read_line_bounded, serve
+from azuma_router.daemon import Router, _read_line_bounded, main, serve
 from azuma_router.errors import JournalWriteError, NumericalIntegrityError, RpcError
+from azuma_router.wal import PendingStore
+
+CODEX = "gpt-5-codex@openai-codex"
+REQUEST = {
+    "task_kind": "code_edit",
+    "input_tokens": 100,
+    "expected_output_tokens": 50,
+    "has_code": True,
+    "has_tools": False,
+    "has_images": False,
+    "agent_depth": 1,
+    "diff_lines": 10,
+    "priority": "normal",
+}
+
+
+def _report_params(decision_id: str) -> dict[str, object]:
+    return {
+        "decision_id": decision_id,
+        "quality": 0.8,
+        "cost_usd": 0.0,
+        "latency_s": 1.0,
+        "actual_input_tokens": 100,
+        "actual_output_tokens": 50,
+    }
+
+
+def _booted_router(
+    tmp_path: Path, clock_fn: Callable[[], float] | None = None, **overrides: object
+) -> Router:
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    router = Router(
+        config=cfg,
+        snapshot_dir=tmp_path / ".azuma",
+        decision_log_path=tmp_path / "decisions.jsonl",
+        clock_fn=clock_fn,
+    )
+    router.boot()
+    for name, value in overrides.items():
+        setattr(router.dlog, name, value)
+    return router
+
+
+def _codex_utilization(router: Router) -> float:
+    return float(router.health({})["arms"][CODEX]["utilization"][0])
+
+
+def test_router_pending_selected_before_a_later_update_survives_snapshot_restart(
+    tmp_path: Path,
+) -> None:
+    """A live pending must be replayed even when the snapshot state_version has moved past it."""
+    router = _booted_router(tmp_path)
+    first = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    second = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    router.report(_report_params(second))
+    router.snapshot({})
+    utilization_before = _codex_utilization(router)
+    router.close()
+
+    restarted = _booted_router(tmp_path)
+    assert restarted.health({})["pending"] == 1
+    assert _codex_utilization(restarted) == pytest.approx(utilization_before)
+    assert restarted.report(_report_params(first))["applied"] is True
+    assert _codex_utilization(restarted) == pytest.approx(utilization_before)
+    restarted.close()
+
+
+def test_router_pending_selected_before_a_later_update_survives_rotation_restart(
+    tmp_path: Path,
+) -> None:
+    """Same scenario when the snapshot is the one forced by WAL rotation."""
+    router = _booted_router(tmp_path, max_bytes=2500)
+    first = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    for _ in range(4):
+        later = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+        router.report(_report_params(later))
+    assert (tmp_path / "decisions.1.jsonl").exists()
+    utilization_before = _codex_utilization(router)
+    router.close()
+
+    restarted = _booted_router(tmp_path)
+    assert restarted.health({})["pending"] == 1
+    assert restarted.report(_report_params(first))["applied"] is True
+    assert _codex_utilization(restarted) == pytest.approx(utilization_before)
+    restarted.close()
 
 
 def test_router_report_and_select_validation_error_handling(tmp_path: Path) -> None:
@@ -646,60 +735,112 @@ def test_snapshot_replay_ledger_idempotency_scenarios(tmp_path: Path) -> None:
     r5.close()
 
 
-# WAL Rotation Carry-Forward Tests
-def test_wal_rotation_carry_forward_and_dedup(tmp_path: Path) -> None:
-    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
-    s_dir = tmp_path / ".azuma"
-    l_path = tmp_path / "decisions.jsonl"
+def _snapshot_bytes(tmp_path: Path) -> bytes | None:
+    state_file = tmp_path / ".azuma" / "snapshot" / "state.json"
+    return state_file.read_bytes() if state_file.exists() else None
 
-    # Tiny max_bytes so every select triggers rotation check
-    r = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
-    r.config = cfg
-    r.boot()
-    r.dlog.max_bytes = 200
 
-    req = {
-        "task_kind": "code_edit",
-        "input_tokens": 100,
-        "expected_output_tokens": 50,
-        "has_code": True,
-        "has_tools": False,
-        "has_images": False,
-        "agent_depth": 1,
-        "diff_lines": 10,
-        "priority": "normal",
-    }
+def test_select_never_takes_the_cadence_snapshot_but_report_does(tmp_path: Path) -> None:
+    clock = [1_000_000.0]
+    router = _booted_router(tmp_path, clock_fn=lambda: clock[0])
+    clock[0] += router.config.bandit.snapshot_every_s + 1  # FR-28 time trigger is due
+    before = _snapshot_bytes(tmp_path)
 
-    # N selects across multiple rotations without reports
-    d_ids = []
-    for _ in range(5):
-        s = r.select({"request": req})
-        d_ids.append(s["decision_id"])
+    d_id = router.select({"request": REQUEST})["decision_id"]
+    assert _snapshot_bytes(tmp_path) == before, "select is read-only w.r.t. snapshots"
 
-    r.dlog.close()
+    router.report(_report_params(d_id))
+    assert _snapshot_bytes(tmp_path) != before
+    router.close()
 
-    # Restart daemon from disk
-    r_restarted = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
-    r_restarted.boot()
 
-    # Every pending must still be reportable without -32002
+def test_report_on_an_evicted_expired_id_is_unknown_not_expired(tmp_path: Path) -> None:
+    router = _booted_router(tmp_path)
+    router.pending_store = PendingStore(max_lru=3)
+    for n, ts in enumerate((10.0, 20.0, 30.0, 40.0), start=1):
+        router.pending_store.mark_expired(f"exp-{n}", ts)
+
+    with pytest.raises(RpcError) as newest:
+        router.report(_report_params("exp-4"))
+    assert newest.value.code == -32003
+
+    with pytest.raises(RpcError) as evicted:
+        router.report(_report_params("exp-1"))
+    assert evicted.value.code == -32002
+    router.close()
+
+
+def _normalized_journal(journal: Path) -> list[str]:
+    normalized = []
+    for line in journal.read_text(encoding="utf-8").splitlines():
+        data = json.loads(line)
+        data["ts"] = 0.0
+        data.pop("ts_select", None)
+        data["decision_id"] = "fixed-uuid"
+        normalized.append(json.dumps(data, sort_keys=True))
+    return normalized
+
+
+def test_journal_determinism_across_runs(tmp_path: Path) -> None:
+    def run_simulation(run_dir: Path) -> list[str]:
+        router = _booted_router(run_dir)
+        d_ids = [router.select({"request": REQUEST})["decision_id"] for _ in range(25)]
+        for d_id in d_ids:
+            router.report(_report_params(d_id))
+        router.close()
+        return _normalized_journal(run_dir / "decisions.jsonl")
+
+    assert run_simulation(tmp_path / "run1") == run_simulation(tmp_path / "run2")
+
+
+def _select_ids(journal: Path) -> set[str]:
+    entries = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+    return {entry["decision_id"] for entry in entries if entry["phase"] == "select"}
+
+
+def test_wal_rotation_carries_live_pendings_without_duplicating_quota(tmp_path: Path) -> None:
+    router = _booted_router(tmp_path, max_bytes=2500)
+    d_ids = [
+        router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+        for _ in range(6)
+    ]
+    rotated_path = tmp_path / "decisions.1.jsonl"
+    assert rotated_path.exists()
+    carried = _select_ids(tmp_path / "decisions.jsonl") & _select_ids(rotated_path)
+    assert carried, "rotation carries live selects forward, so some select lives in both segments"
+    utilization_before = _codex_utilization(router)
+    router.close()
+
+    restarted = _booted_router(tmp_path)
+    assert restarted.health({})["pending"] == len(d_ids)
+    assert _codex_utilization(restarted) == pytest.approx(utilization_before)
     for d_id in d_ids:
-        res = r_restarted.report(
-            {
-                "decision_id": d_id,
-                "quality": 0.8,
-                "cost_usd": 0.0,
-                "latency_s": 1.0,
-                "actual_input_tokens": 100,
-                "actual_output_tokens": 50,
-            }
-        )
-        assert res["applied"] is True
-
-    r_restarted.close()
+        assert restarted.report(_report_params(d_id))["applied"] is True
+    assert _codex_utilization(restarted) == pytest.approx(utilization_before)
+    restarted.close()
 
 
-# Diagnostics Masked Arm Null Tests
+def test_wal_report_appended_after_rotation_is_reapplied_on_restart(tmp_path: Path) -> None:
+    router = _booted_router(tmp_path, max_bytes=2500)
+    d_ids = [
+        router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+        for _ in range(4)
+    ]
+    assert (tmp_path / "decisions.1.jsonl").exists()
+    assert router.dlog is not None
+    router.dlog.max_bytes = 10**9  # freeze rotation: the report must not snapshot again
+    snapshot_version = router.health({})["state_version"]
+    router.report(_report_params(d_ids[0]))  # lands in the active segment, after the snapshot
+    assert router.health({})["state_version"] == snapshot_version + 1
+    router.dlog.close()  # crash: no shutdown snapshot
+
+    restarted = _booted_router(tmp_path)
+    assert restarted.health({})["state_version"] == snapshot_version + 1
+    assert restarted.report(_report_params(d_ids[0]))["applied"] is False
+    assert restarted.health({})["pending"] == len(d_ids) - 1
+    restarted.close()
+
+
 def test_verbose_select_masked_arm_diagnostics_null(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     s_dir = tmp_path / ".azuma"
@@ -747,105 +888,107 @@ def test_verbose_select_masked_arm_diagnostics_null(tmp_path: Path) -> None:
 
 
 # Non-finite Score Handling Tests
+def _force_nan_scores(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Makes select_jit report NaN scores while leaving the sampled arm untouched."""
+    real_select_jit = daemon_mod.select_jit
+
+    def nan_select_jit(state: Any, x: Any, qv: Any, static: Any) -> tuple[Any, Any, Any, Any]:
+        state_next, arm_index, propensity, diag = real_select_jit(state, x, qv, static)
+        return state_next, arm_index, propensity, diag._replace(score=np.full(static.k_max, np.nan))
+
+    monkeypatch.setattr(daemon_mod, "select_jit", nan_select_jit)
+
+
 def test_select_non_finite_score_raises_numerical_integrity_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
-    s_dir = tmp_path / ".azuma"
-    l_path = tmp_path / "decisions.jsonl"
-
-    router = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
-    router.boot()
-
-    from azuma_router import daemon as daemon_mod
-
-    orig_select_jit = daemon_mod.select_jit
-
-    from typing import Any
-
-    def mock_select_jit(state: Any, x: Any, qv: Any, static: Any) -> tuple[Any, Any, Any, Any]:
-        st_next, arm_i, prop, diag = orig_select_jit(state, x, qv, static)
-        nan_score = np.array([float("nan")] * static.k_max)
-        new_diag = diag._replace(score=nan_score)
-        return st_next, arm_i, prop, new_diag
-
-    monkeypatch.setattr(daemon_mod, "select_jit", mock_select_jit)
-
-    req = {
-        "task_kind": "code_edit",
-        "input_tokens": 100,
-        "expected_output_tokens": 50,
-        "has_code": True,
-        "has_tools": False,
-        "has_images": False,
-        "agent_depth": 1,
-        "diff_lines": 10,
-        "priority": "normal",
-    }
+    router = _booted_router(tmp_path)
+    _force_nan_scores(monkeypatch)
 
     orig_ver = router.state_version
     with pytest.raises(NumericalIntegrityError):
-        router.select({"request": req})
+        router.select({"request": REQUEST})
 
     assert router.state_version == orig_ver
     assert len(router.pending_store) == 0
-    assert not l_path.exists() or len(l_path.read_text(encoding="utf-8").strip()) == 0
+    assert (tmp_path / "decisions.jsonl").read_text(encoding="utf-8") == ""
 
     router.close()
 
 
 # Journal Write Error Stdio Test
+@pytest.mark.parametrize(
+    "boot_error", [JournalWriteError("wal locked"), NumericalIntegrityError("nan")]
+)
+def test_main_exits_4_when_boot_raises_a_fatal_integrity_error(
+    monkeypatch: pytest.MonkeyPatch, boot_error: Exception
+) -> None:
+    def failing_boot(self: Router) -> dict[str, object]:
+        raise boot_error
+
+    monkeypatch.setattr(Router, "boot", failing_boot)
+    monkeypatch.setattr(
+        sys, "argv", ["azuma-router", "--config", "fixtures/config/azuma.valid.toml"]
+    )
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    assert exit_info.value.code == 4
+    assert "boot" in stderr.getvalue()
+
+
+def _serve_one_request(
+    router: Router, method: str, params: dict[str, object]
+) -> tuple[int | None, list[dict[str, object]]]:
+    """Serves a single request until exit; returns (exit code, stderr events)."""
+    request = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    stdin, stdout, stderr = io.StringIO(json.dumps(request) + "\n"), io.StringIO(), io.StringIO()
+    with pytest.raises(SystemExit) as exit_info:
+        serve(stdin, stdout, stderr, router, exit_on_eof=False)
+    events = [json.loads(line) for line in stderr.getvalue().splitlines()]
+    return exit_info.value.code, events
+
+
 def test_serve_exits_4_on_journal_write_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
-    s_dir = tmp_path / ".azuma"
-    l_path = tmp_path / "decisions.jsonl"
+    router = _booted_router(tmp_path)
 
-    router = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
-    router.boot()
-
-    req_json = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "select",
-        "params": {
-            "request": {
-                "task_kind": "code_edit",
-                "input_tokens": 100,
-                "expected_output_tokens": 50,
-                "has_code": True,
-                "has_tools": False,
-                "has_images": False,
-                "agent_depth": 1,
-                "diff_lines": 10,
-                "priority": "normal",
-            }
-        },
-    }
-
-    stdin = io.StringIO(json.dumps(req_json) + "\n")
-    stdout = io.StringIO()
-    stderr = io.StringIO()
-
-    def bad_append(entry: dict) -> None:
+    def bad_append(entry: dict[str, object]) -> None:
         raise JournalWriteError("Write failed")
 
-    assert router.dlog is not None
     monkeypatch.setattr(router.dlog, "append", bad_append)
 
-    exited_code = None
+    code, events = _serve_one_request(router, "select", {"request": REQUEST})
 
-    def mock_exit(code: int) -> None:
-        nonlocal exited_code
-        exited_code = code
-        raise SystemExit(code)
+    assert code == 4
+    assert [e["event"] for e in events if e["level"] == "error"] == ["journal_write_error"]
 
-    import sys
 
-    monkeypatch.setattr(sys, "exit", mock_exit)
+def test_serve_exits_4_when_select_hits_a_non_finite_score(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    router = _booted_router(tmp_path)
+    _force_nan_scores(monkeypatch)
+    capsys.readouterr()  # drop boot logs
 
-    with pytest.raises(SystemExit):
-        serve(stdin, stdout, stderr, router, exit_on_eof=False)
+    code, events = _serve_one_request(router, "select", {"request": REQUEST})
 
-    assert exited_code == 4
+    assert code == 4
+    assert [e["event"] for e in events if e["level"] == "error"] == ["numerical_integrity_error"]
+    assert "non_finite" not in capsys.readouterr().err, "serve owns the fatal log; no double log"
+
+
+def test_serve_exits_4_when_a_result_contains_a_non_finite_float(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router = _booted_router(tmp_path)
+    monkeypatch.setattr(router, "health", lambda params: {"state_version": float("inf")})
+
+    code, events = _serve_one_request(router, "health", {})
+
+    assert code == 4
+    assert [e["event"] for e in events if e["level"] == "error"] == ["numerical_integrity_error"]

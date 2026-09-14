@@ -49,6 +49,15 @@ class LedgerEventNotFoundError(AzumaError):
         self.arm_id = arm_id
 
 
+class LedgerEventDuplicateError(AzumaError):
+    """A ledger event_id was recorded twice; ids are the WAL replay idempotency key (FR-23)."""
+
+    def __init__(self, event_id: int, arm_id: str) -> None:
+        super().__init__(f"Ledger event {event_id} already recorded for arm {arm_id}")
+        self.event_id = event_id
+        self.arm_id = arm_id
+
+
 class RpcError(AzumaError):
     """A JSON-RPC 2.0 application error (codes per ADR-0014)."""
 

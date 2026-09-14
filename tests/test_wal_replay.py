@@ -1,5 +1,6 @@
 """Tests for WAL replay (T18 & AC-20)."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -92,20 +93,12 @@ def test_replay_select_missing_ledger_event_id_raises(tmp_path: Path) -> None:
         "featurizer_version": 1,
     }
     # Notice no ledger_event_id in line!
-    wal_path.write_text(import_json_dumps(line) + "\n", encoding="utf-8")
+    wal_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
 
-    with pytest.raises(ValueError) as exc_info:
+    with pytest.raises(ValueError, match="ledger_event_id"):
         replay_log(
             active_path=wal_path,
             rotated_path=None,
             snapshot_state_version=0,
             config=cfg,
         )
-    msg = str(exc_info.value)
-    assert "Missing ledger_event_id" in msg or "ledger_event_id" in msg
-
-
-def import_json_dumps(obj: object) -> str:
-    import json
-
-    return json.dumps(obj)
