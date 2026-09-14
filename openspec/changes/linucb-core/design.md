@@ -128,6 +128,8 @@ Dependencias solo hacia abajo: `daemon → {wal, snapshot, quota, reward, featur
 | F12 | Cholesky rank-1 update | ADR-0002 | `d ≥ 256` |
 | F13 | `fsync` por línea del journal | D11 | durabilidad ante corte de energía |
 | F14 | gRPC/HTTP | ADR-0010 | nunca como dual-path; solo sustitución |
+| F15 | Contención explícita de peticiones sólo-select y replay en streaming (SF-4) | SEC-3 | tráfico sólo-select masivo |
+| F16 | Modularización de daemon.py (loop de protocolo / router / validación) (CC-4) | CC-4 | refactor de mantenibilidad |
 
 ## Migration Plan
 

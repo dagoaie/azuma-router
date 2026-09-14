@@ -1,0 +1,37 @@
+schema_version = 1
+
+[bandit]
+seed = 42
+k_max = 32
+w_max = 4
+d = 32
+ridge_lambda = 1.0
+alpha = 1.0
+tau = 0.5
+epsilon_floor = 0.02
+w_quality = 1.0
+w_cost = 0.3
+w_latency = 0.2
+cost_budget_usd = 0.05
+latency_budget_s = 30.0
+pending_ttl_s = 3600
+snapshot_dir = ".azuma"
+snapshot_every_updates = 100
+snapshot_every_s = 3600
+decision_log_path = "decisions.jsonl"
+decision_log_max_bytes = 268435456
+
+[[arms]]
+model_id = "gpt-5-codex"
+provider = "openai-codex"
+billing_mode = "subscription"
+price_in_per_1m = 0.0
+price_out_per_1m = 15.0
+units_per_request = 1.0
+units_per_1k_tokens = 0.001
+barrier_mu = 0.5
+
+[[arms.windows]]
+kind = "rolling"
+capacity = 1000.0
+duration_s = 18000

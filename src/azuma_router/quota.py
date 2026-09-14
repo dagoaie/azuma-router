@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from azuma_router.config import ArmConfig, Config
+from azuma_router.errors import LedgerEventNotFoundError
 
 
 @dataclass
@@ -73,13 +74,12 @@ class QuotaLedger:
 
     def correct(self, event_id: int, arm_id: str, actual_units: float) -> None:
         """Corrects an existing ledger event in-place with actual observed units (FR-16)."""
-        if arm_id not in self.events:
-            return
-
-        for ev in self.events[arm_id]:
-            if ev.event_id == event_id:
-                ev.units = actual_units
-                return
+        if arm_id in self.events:
+            for ev in self.events[arm_id]:
+                if ev.event_id == event_id:
+                    ev.units = actual_units
+                    return
+        raise LedgerEventNotFoundError(event_id, arm_id)
 
     def _get_max_window_duration_s(self, arm: ArmConfig) -> float:
         """Calculates max history window duration in seconds needed for pruning."""

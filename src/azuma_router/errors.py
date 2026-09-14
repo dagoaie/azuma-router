@@ -32,6 +32,19 @@ class IncompatibleSnapshotError(AzumaError):
     """Snapshot shapes/ids differ from the running config; no migration path exists (ADR-0009)."""
 
 
+class JournalWriteError(AzumaError):
+    """Fatal failure writing or flushing to the decision journal (WAL)."""
+
+
+class LedgerEventNotFoundError(AzumaError):
+    """Target ledger event_id was not found in QuotaLedger (FR-16 / MF-3)."""
+
+    def __init__(self, event_id: int, arm_id: str) -> None:
+        super().__init__(f"Ledger event {event_id} not found for arm {arm_id}")
+        self.event_id = event_id
+        self.arm_id = arm_id
+
+
 class RpcError(AzumaError):
     """A JSON-RPC 2.0 application error (codes per ADR-0014)."""
 

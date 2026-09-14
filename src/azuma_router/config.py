@@ -98,30 +98,7 @@ def _req_dict_val(
     return val
 
 
-def load_config(path: str | Path) -> Config:
-    path_obj = Path(path)
-    if not path_obj.exists():
-        raise ConfigError("file", f"Configuration file not found: {path_obj}")
-
-    with path_obj.open("rb") as f:
-        try:
-            data = tomllib.load(f)
-        except Exception as e:
-            raise ConfigError("toml", f"TOML parse error: {e}") from e
-
-    # schema_version
-    if "schema_version" not in data:
-        raise ConfigError("schema_version", "Missing mandatory field 'schema_version'")
-    schema_ver = data["schema_version"]
-    if not isinstance(schema_ver, int) or schema_ver != 1:
-        raise ConfigError("schema_version", f"schema_version must be 1, got {schema_ver!r}")
-
-    # [bandit]
-    if "bandit" not in data or not isinstance(data["bandit"], dict):
-        raise ConfigError("bandit", "Missing mandatory section '[bandit]'")
-
-    b_data = data["bandit"]
-
+def _parse_bandit_config(b_data: dict[str, Any]) -> BanditConfig:
     def req_b(name: str, types: type | tuple[type, ...]) -> Any:
         return _req_dict_val(b_data, "bandit", name, types)
 
@@ -195,7 +172,7 @@ def load_config(path: str | Path) -> Config:
     if decision_log_max_bytes <= 0:
         raise ConfigError("bandit.decision_log_max_bytes", "decision_log_max_bytes must be > 0")
 
-    bandit_cfg = BanditConfig(
+    return BanditConfig(
         seed=seed,
         k_max=k_max,
         w_max=w_max,
@@ -217,149 +194,182 @@ def load_config(path: str | Path) -> Config:
         decision_log_max_bytes=decision_log_max_bytes,
     )
 
+
+def _parse_window_config(w_data: Any, w_prefix: str) -> WindowConfig:
+    if not isinstance(w_data, dict):
+        raise ConfigError(w_prefix, "Window entry must be a dictionary")
+
+    kind = w_data.get("kind")
+    if kind not in ("rolling", "fixed_reset"):
+        msg = f"kind must be 'rolling' or 'fixed_reset', got {kind!r}"
+        raise ConfigError(f"{w_prefix}.kind", msg)
+
+    cap = w_data.get("capacity")
+    if cap is None:
+        raise ConfigError(f"{w_prefix}.capacity", "Missing mandatory field 'capacity'")
+    if isinstance(cap, int) and not isinstance(cap, bool):
+        cap = float(cap)
+    if not isinstance(cap, float) or cap <= 0:
+        raise ConfigError(f"{w_prefix}.capacity", "capacity must be a float > 0")
+
+    duration_s: int | None = None
+    period: str | None = None
+    reset_anchor: str | None = None
+
+    if kind == "rolling":
+        duration_s = w_data.get("duration_s")
+        if duration_s is None or not isinstance(duration_s, int) or duration_s <= 0:
+            msg = "rolling window requires duration_s int > 0"
+            raise ConfigError(f"{w_prefix}.duration_s", msg)
+    elif kind == "fixed_reset":
+        period = w_data.get("period")
+        if period not in ("daily", "weekly"):
+            msg = "fixed_reset window period must be 'daily' or 'weekly'"
+            raise ConfigError(f"{w_prefix}.period", msg)
+        reset_anchor = w_data.get("reset_anchor")
+        if not reset_anchor or not isinstance(reset_anchor, str):
+            msg = "fixed_reset window requires reset_anchor RFC 3339 string"
+            raise ConfigError(f"{w_prefix}.reset_anchor", msg)
+        try:
+            datetime.fromisoformat(reset_anchor.replace("Z", "+00:00"))
+        except ValueError as exc:
+            msg = f"Invalid RFC 3339 timestamp: {reset_anchor!r}"
+            raise ConfigError(f"{w_prefix}.reset_anchor", msg) from exc
+
+    return WindowConfig(
+        kind=kind,
+        capacity=cap,
+        duration_s=duration_s,
+        period=period,
+        reset_anchor=reset_anchor,
+    )
+
+
+def _parse_arm_config(a_data: Any, index: int, w_max: int, seen_arm_ids: set[str]) -> ArmConfig:
+    prefix = f"arms[{index}]"
+    if not isinstance(a_data, dict):
+        raise ConfigError(prefix, "Arm entry must be a dictionary")
+
+    model_id = _req_dict_val(a_data, prefix, "model_id", str)
+    if not model_id or "@" in model_id:
+        raise ConfigError(f"{prefix}.model_id", "model_id cannot be empty or contain '@'")
+
+    provider = _req_dict_val(a_data, prefix, "provider", str)
+    if not provider or "@" in provider:
+        raise ConfigError(f"{prefix}.provider", "provider cannot be empty or contain '@'")
+
+    arm_id = f"{model_id}@{provider}"
+    if arm_id in seen_arm_ids:
+        raise ConfigError(prefix, f"Duplicate arm_id: {arm_id}")
+    seen_arm_ids.add(arm_id)
+
+    billing_mode = _req_dict_val(a_data, prefix, "billing_mode", str)
+    if billing_mode not in ("subscription", "per_token"):
+        raise ConfigError(
+            f"{prefix}.billing_mode",
+            f"billing_mode must be 'subscription' or 'per_token', got {billing_mode!r}",
+        )
+
+    price_in_per_1m = _req_dict_val(a_data, prefix, "price_in_per_1m", float)
+    if price_in_per_1m < 0:
+        raise ConfigError(f"{prefix}.price_in_per_1m", "price_in_per_1m must be >= 0")
+    if billing_mode == "subscription" and price_in_per_1m != 0.0:
+        msg = "price_in_per_1m must be 0 for subscription arms"
+        raise ConfigError(f"{prefix}.price_in_per_1m", msg)
+
+    price_out_per_1m = _req_dict_val(a_data, prefix, "price_out_per_1m", float)
+    if price_out_per_1m < 0:
+        raise ConfigError(f"{prefix}.price_out_per_1m", "price_out_per_1m must be >= 0")
+    if billing_mode == "subscription" and price_out_per_1m != 0.0:
+        msg = "price_out_per_1m must be 0 for subscription arms"
+        raise ConfigError(f"{prefix}.price_out_per_1m", msg)
+
+    units_per_request = _req_dict_val(a_data, prefix, "units_per_request", float)
+    if units_per_request < 0:
+        raise ConfigError(f"{prefix}.units_per_request", "units_per_request must be >= 0")
+
+    units_per_1k_tokens = _req_dict_val(a_data, prefix, "units_per_1k_tokens", float)
+    if units_per_1k_tokens < 0:
+        raise ConfigError(f"{prefix}.units_per_1k_tokens", "units_per_1k_tokens must be >= 0")
+
+    barrier_mu = _req_dict_val(a_data, prefix, "barrier_mu", float)
+    if barrier_mu < 0:
+        raise ConfigError(f"{prefix}.barrier_mu", "barrier_mu must be >= 0")
+    if billing_mode == "per_token" and barrier_mu != 0.0:
+        raise ConfigError(f"{prefix}.barrier_mu", "barrier_mu must be 0.0 for per_token arms")
+
+    raw_windows = a_data.get("windows", [])
+    if billing_mode == "per_token" and "windows" in a_data and raw_windows:
+        raise ConfigError(f"{prefix}.windows", "per_token arms cannot have quota windows")
+
+    if billing_mode == "subscription" and not raw_windows:
+        msg = "subscription arms must have at least one window"
+        raise ConfigError(f"{prefix}.windows", msg)
+
+    if len(raw_windows) > w_max:
+        raise ConfigError(
+            f"{prefix}.windows",
+            f"Number of windows ({len(raw_windows)}) exceeds w_max ({w_max})",
+        )
+
+    window_configs = [
+        _parse_window_config(w_data, f"{prefix}.windows[{j}]")
+        for j, w_data in enumerate(raw_windows)
+    ]
+
+    return ArmConfig(
+        model_id=model_id,
+        provider=provider,
+        billing_mode=billing_mode,
+        price_in_per_1m=price_in_per_1m,
+        price_out_per_1m=price_out_per_1m,
+        units_per_request=units_per_request,
+        units_per_1k_tokens=units_per_1k_tokens,
+        barrier_mu=barrier_mu,
+        windows=tuple(window_configs),
+    )
+
+
+def load_config(path: str | Path) -> Config:
+    path_obj = Path(path)
+    if not path_obj.exists():
+        raise ConfigError("file", f"Configuration file not found: {path_obj}")
+
+    with path_obj.open("rb") as f:
+        try:
+            data = tomllib.load(f)
+        except Exception as e:
+            raise ConfigError("toml", f"TOML parse error: {e}") from e
+
+    # schema_version
+    if "schema_version" not in data:
+        raise ConfigError("schema_version", "Missing mandatory field 'schema_version'")
+    schema_ver = data["schema_version"]
+    if not isinstance(schema_ver, int) or schema_ver != 1:
+        raise ConfigError("schema_version", f"schema_version must be 1, got {schema_ver!r}")
+
+    # [bandit]
+    if "bandit" not in data or not isinstance(data["bandit"], dict):
+        raise ConfigError("bandit", "Missing mandatory section '[bandit]'")
+
+    bandit_cfg = _parse_bandit_config(data["bandit"])
+
     # [[arms]]
     if "arms" not in data or not isinstance(data["arms"], list):
         raise ConfigError("arms", "Missing mandatory list '[[arms]]'")
 
     arms_list = data["arms"]
-    if len(arms_list) < 1 or len(arms_list) > k_max:
-        msg = f"Number of arms must be between 1 and k_max ({k_max}), got {len(arms_list)}"
+    if len(arms_list) < 1 or len(arms_list) > bandit_cfg.k_max:
+        msg = (
+            f"Number of arms must be between 1 and k_max ({bandit_cfg.k_max}), got {len(arms_list)}"
+        )
         raise ConfigError("arms", msg)
 
     seen_arm_ids: set[str] = set()
-    arm_configs: list[ArmConfig] = []
-
-    for i, a_data in enumerate(arms_list):
-        prefix = f"arms[{i}]"
-        if not isinstance(a_data, dict):
-            raise ConfigError(prefix, "Arm entry must be a dictionary")
-
-        model_id = _req_dict_val(a_data, prefix, "model_id", str)
-        if not model_id or "@" in model_id:
-            raise ConfigError(f"{prefix}.model_id", "model_id cannot be empty or contain '@'")
-
-        provider = _req_dict_val(a_data, prefix, "provider", str)
-        if not provider or "@" in provider:
-            raise ConfigError(f"{prefix}.provider", "provider cannot be empty or contain '@'")
-
-        arm_id = f"{model_id}@{provider}"
-        if arm_id in seen_arm_ids:
-            raise ConfigError(prefix, f"Duplicate arm_id: {arm_id}")
-        seen_arm_ids.add(arm_id)
-
-        billing_mode = _req_dict_val(a_data, prefix, "billing_mode", str)
-        if billing_mode not in ("subscription", "per_token"):
-            raise ConfigError(
-                f"{prefix}.billing_mode",
-                f"billing_mode must be 'subscription' or 'per_token', got {billing_mode!r}",
-            )
-
-        price_in_per_1m = _req_dict_val(a_data, prefix, "price_in_per_1m", float)
-        if price_in_per_1m < 0:
-            raise ConfigError(f"{prefix}.price_in_per_1m", "price_in_per_1m must be >= 0")
-        if billing_mode == "subscription" and price_in_per_1m != 0.0:
-            msg = "price_in_per_1m must be 0 for subscription arms"
-            raise ConfigError(f"{prefix}.price_in_per_1m", msg)
-
-        price_out_per_1m = _req_dict_val(a_data, prefix, "price_out_per_1m", float)
-        if price_out_per_1m < 0:
-            raise ConfigError(f"{prefix}.price_out_per_1m", "price_out_per_1m must be >= 0")
-
-        units_per_request = _req_dict_val(a_data, prefix, "units_per_request", float)
-        if units_per_request < 0:
-            raise ConfigError(f"{prefix}.units_per_request", "units_per_request must be >= 0")
-
-        units_per_1k_tokens = _req_dict_val(a_data, prefix, "units_per_1k_tokens", float)
-        if units_per_1k_tokens < 0:
-            raise ConfigError(f"{prefix}.units_per_1k_tokens", "units_per_1k_tokens must be >= 0")
-
-        barrier_mu = _req_dict_val(a_data, prefix, "barrier_mu", float)
-        if barrier_mu < 0:
-            raise ConfigError(f"{prefix}.barrier_mu", "barrier_mu must be >= 0")
-        if billing_mode == "per_token" and barrier_mu != 0.0:
-            raise ConfigError(f"{prefix}.barrier_mu", "barrier_mu must be 0.0 for per_token arms")
-
-        # Windows
-        raw_windows = a_data.get("windows", [])
-        if billing_mode == "per_token" and "windows" in a_data and raw_windows:
-            raise ConfigError(f"{prefix}.windows", "per_token arms cannot have quota windows")
-
-        if billing_mode == "subscription" and not raw_windows:
-            msg = "subscription arms must have at least one window"
-            raise ConfigError(f"{prefix}.windows", msg)
-
-        if len(raw_windows) > w_max:
-            raise ConfigError(
-                f"{prefix}.windows",
-                f"Number of windows ({len(raw_windows)}) exceeds w_max ({w_max})",
-            )
-
-        window_configs: list[WindowConfig] = []
-        for j, w_data in enumerate(raw_windows):
-            w_prefix = f"{prefix}.windows[{j}]"
-            if not isinstance(w_data, dict):
-                raise ConfigError(w_prefix, "Window entry must be a dictionary")
-
-            kind = w_data.get("kind")
-            if kind not in ("rolling", "fixed_reset"):
-                msg = f"kind must be 'rolling' or 'fixed_reset', got {kind!r}"
-                raise ConfigError(f"{w_prefix}.kind", msg)
-
-            cap = w_data.get("capacity")
-            if cap is None:
-                raise ConfigError(f"{w_prefix}.capacity", "Missing mandatory field 'capacity'")
-            if isinstance(cap, int) and not isinstance(cap, bool):
-                cap = float(cap)
-            if not isinstance(cap, float) or cap <= 0:
-                raise ConfigError(f"{w_prefix}.capacity", "capacity must be a float > 0")
-
-            duration_s: int | None = None
-            period: str | None = None
-            reset_anchor: str | None = None
-
-            if kind == "rolling":
-                duration_s = w_data.get("duration_s")
-                if duration_s is None or not isinstance(duration_s, int) or duration_s <= 0:
-                    msg = "rolling window requires duration_s int > 0"
-                    raise ConfigError(f"{w_prefix}.duration_s", msg)
-            elif kind == "fixed_reset":
-                period = w_data.get("period")
-                if period not in ("daily", "weekly"):
-                    msg = "fixed_reset window period must be 'daily' or 'weekly'"
-                    raise ConfigError(f"{w_prefix}.period", msg)
-                reset_anchor = w_data.get("reset_anchor")
-                if not reset_anchor or not isinstance(reset_anchor, str):
-                    msg = "fixed_reset window requires reset_anchor RFC 3339 string"
-                    raise ConfigError(f"{w_prefix}.reset_anchor", msg)
-                try:
-                    datetime.fromisoformat(reset_anchor.replace("Z", "+00:00"))
-                except ValueError as exc:
-                    msg = f"Invalid RFC 3339 timestamp: {reset_anchor!r}"
-                    raise ConfigError(f"{w_prefix}.reset_anchor", msg) from exc
-
-            window_configs.append(
-                WindowConfig(
-                    kind=kind,
-                    capacity=cap,
-                    duration_s=duration_s,
-                    period=period,
-                    reset_anchor=reset_anchor,
-                )
-            )
-
-        arm_configs.append(
-            ArmConfig(
-                model_id=model_id,
-                provider=provider,
-                billing_mode=billing_mode,
-                price_in_per_1m=price_in_per_1m,
-                price_out_per_1m=price_out_per_1m,
-                units_per_request=units_per_request,
-                units_per_1k_tokens=units_per_1k_tokens,
-                barrier_mu=barrier_mu,
-                windows=tuple(window_configs),
-            )
-        )
+    arm_configs = [
+        _parse_arm_config(a_data, i, bandit_cfg.w_max, seen_arm_ids)
+        for i, a_data in enumerate(arms_list)
+    ]
 
     return Config(
         schema_version=schema_ver,

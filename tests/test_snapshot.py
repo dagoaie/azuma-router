@@ -162,4 +162,4 @@ def test_restore_config_sha256_mismatch_warning(
     assert restored_meta.state_version == 10
 
     captured = capsys.readouterr()
-    assert "WARNING" in captured.err or "Config SHA256 mismatch" in captured.err
+    assert "warning" in captured.err.lower() or "config_sha256_mismatch" in captured.err

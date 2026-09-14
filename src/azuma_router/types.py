@@ -79,6 +79,17 @@ class RoutingRequest:
             msg = f"Invalid priority type: {type(self.priority)}"
             raise InvalidContextError("priority", msg)
 
+        if not isinstance(self.has_code, bool):
+            raise InvalidContextError("has_code", f"has_code must be bool, got {self.has_code!r}")
+
+        if not isinstance(self.has_tools, bool):
+            msg = f"has_tools must be bool, got {self.has_tools!r}"
+            raise InvalidContextError("has_tools", msg)
+
+        if not isinstance(self.has_images, bool):
+            msg = f"has_images must be bool, got {self.has_images!r}"
+            raise InvalidContextError("has_images", msg)
+
         if (
             not isinstance(self.input_tokens, int)
             or isinstance(self.input_tokens, bool)

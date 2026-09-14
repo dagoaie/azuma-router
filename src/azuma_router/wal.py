@@ -7,11 +7,15 @@ import json
 from collections import OrderedDict
 from io import TextIOWrapper
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+if TYPE_CHECKING:
+    from azuma_router.quota import QuotaLedger
+
 from azuma_router.config import Config
+from azuma_router.errors import JournalWriteError
 from azuma_router.types import Pending
 
 
@@ -26,13 +30,18 @@ class DecisionLog:
 
     def append(self, entry: dict[str, Any]) -> None:
         """Appends a single JSONL line and flushes immediately (FR-20)."""
-        line = json.dumps(entry, separators=(",", ":")) + "\n"
-        self.file.write(line)
-        self.file.flush()
+        try:
+            line = json.dumps(entry, separators=(",", ":"), allow_nan=False) + "\n"
+            self.file.write(line)
+            self.file.flush()
 
-        phase = entry.get("phase")
-        if phase in ("report", "expire"):
-            self._maybe_rotate()
+            phase = entry.get("phase")
+            if phase in ("report", "expire"):
+                self._maybe_rotate()
+        except JournalWriteError:
+            raise
+        except Exception as err:
+            raise JournalWriteError(f"WAL append failed: {err}") from err
 
     def _maybe_rotate(self) -> None:
         """Rotates file to decisions.1.jsonl if size exceeds max_bytes."""
@@ -62,6 +71,7 @@ class PendingStore:
     def __init__(self, max_lru: int = 10000) -> None:
         self._pending: OrderedDict[str, Pending] = OrderedDict()
         self._applied_ids: OrderedDict[str, None] = OrderedDict()
+        self._expired_ids: OrderedDict[str, float] = OrderedDict()
         self._max_lru = max_lru
 
     def put(self, pending: Pending) -> None:
@@ -81,6 +91,17 @@ class PendingStore:
         if len(self._applied_ids) > self._max_lru:
             self._applied_ids.popitem(last=False)
 
+    def is_expired(self, decision_id: str) -> bool:
+        return decision_id in self._expired_ids
+
+    def get_expired_at(self, decision_id: str) -> float | None:
+        return self._expired_ids.get(decision_id)
+
+    def mark_expired(self, decision_id: str, expired_at: float) -> None:
+        self._expired_ids[decision_id] = expired_at
+        if len(self._expired_ids) > self._max_lru:
+            self._expired_ids.popitem(last=False)
+
     def sweep(self, now: float, ttl_s: float) -> list[Pending]:
         """Sweeps expired pending decisions in insertion order until first non-expired (FR-22)."""
         expired: list[Pending] = []
@@ -90,6 +111,7 @@ class PendingStore:
             if now - p.ts_select > ttl_s:
                 expired.append(p)
                 to_delete.append(d_id)
+                self.mark_expired(d_id, p.ts_select + ttl_s)
             else:
                 break
 
@@ -110,12 +132,14 @@ def replay_log(
     rotated_path: Path | None,
     snapshot_state_version: int,
     config: Config,
+    ledger: "QuotaLedger | None" = None,
 ) -> tuple[PendingStore, list[tuple[int, np.ndarray, int, float]], set[str]]:
     """Replays JSONL WAL files in order to restore PendingStore and unapplied updates (FR-23)."""
     pending_store = PendingStore()
     applied_reports: list[tuple[int, np.ndarray, int, float]] = []
     applied_ids: set[str] = set()
     select_by_id: dict[str, dict[str, Any]] = {}
+    pending_event_ids: dict[str, int] = {}
 
     files_to_read: list[Path] = []
     if rotated_path and rotated_path.exists():
@@ -149,6 +173,14 @@ def replay_log(
             if phase == "select":
                 select_by_id[d_id] = entry
                 if s_ver >= snapshot_state_version:
+                    eid = 0
+                    if ledger is not None:
+                        eid = ledger.record(
+                            entry["arm_id"],
+                            float(entry.get("est_units", 0.0)),
+                            float(entry["ts"]),
+                        )
+                    pending_event_ids[d_id] = eid
                     pending = Pending(
                         decision_id=d_id,
                         arm_index=entry["arm_index"],
@@ -156,7 +188,7 @@ def replay_log(
                         propensity=entry["propensity"],
                         ts_select=entry["ts"],
                         est_units=entry.get("est_units", 0.0),
-                        ledger_event_id=0,
+                        ledger_event_id=eid,
                         state_version=s_ver,
                     )
                     pending_store.put(pending)
@@ -165,6 +197,12 @@ def replay_log(
                 pending_store.pop(d_id)
                 applied_ids.add(d_id)
                 pending_store.mark_applied(d_id)
+                eid = pending_event_ids.pop(d_id, 0)
+                if ledger is not None and eid > 0:
+                    arm_id = select_by_id[d_id]["arm_id"] if d_id in select_by_id else ""
+                    actual_u = float(entry.get("actual_units", 0.0))
+                    if arm_id:
+                        ledger.correct(eid, arm_id, actual_u)
                 if s_ver > snapshot_state_version:
                     if d_id in select_by_id:
                         s_entry = select_by_id[d_id]
@@ -175,5 +213,8 @@ def replay_log(
 
             elif phase == "expire":
                 pending_store.pop(d_id)
+                pending_event_ids.pop(d_id, None)
+                ts_select = float(entry.get("ts_select", entry.get("ts", 0.0)))
+                pending_store.mark_expired(d_id, ts_select + config.bandit.pending_ttl_s)
 
     return pending_store, applied_reports, applied_ids

@@ -32,6 +32,7 @@ def test_load_valid_config() -> None:
         ("sub_without_windows.toml", "arms[0].windows"),
         ("per_token_with_windows.toml", "arms[0].windows"),
         ("per_token_with_mu.toml", "arms[0].barrier_mu"),
+        ("sub_with_price_out.toml", "arms[0].price_out_per_1m"),
         ("bad_type.toml", "bandit.seed"),
         ("too_many_arms.toml", "arms"),
         ("too_many_windows.toml", "arms[0].windows"),

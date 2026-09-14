@@ -36,8 +36,6 @@ def _select_pure(
     static: StaticConfig,
 ) -> tuple[BanditState, jnp.ndarray, float | jnp.ndarray, Diagnostics]:
     """Pure JAX LinUCB select step (ADR-0001, ADR-0008)."""
-    _compile_count["select"] += 1
-
     exploit, bonus = _vmap_score_arms(state.A, state.b, x, static.alpha)
 
     # Shadow price via log barrier (ADR-0006)
@@ -81,12 +79,14 @@ def _select_pure(
     propensity = jnp.where(no_arm_available, 0.0, policy[arm])
     out_policy = jnp.where(no_arm_available, jnp.zeros(static.k_max, dtype=F64), policy)
 
+    next_rng_key = jnp.where(no_arm_available, state.rng_key, rng_key)
+
     state_prime = BanditState(
         A=state.A,
         b=state.b,
         n_pulls=state.n_pulls,
         mask=state.mask,
-        rng_key=rng_key,
+        rng_key=next_rng_key,
     )
     diagnostics = Diagnostics(
         exploit=exploit,
@@ -108,8 +108,6 @@ def _update_pure(
     static: StaticConfig,
 ) -> BanditState:
     """Pure JAX LinUCB rank-1 update (FR-11, FR-12, ADR-0002)."""
-    _compile_count["update"] += 1
-
     x_outer = jnp.outer(x, x)
     arm_idx = jnp.array(arm, dtype=I32)
     r_val = jnp.array(reward, dtype=F64)
@@ -127,8 +125,29 @@ def _update_pure(
     )
 
 
+def _select_traced(
+    state: BanditState,
+    x: jnp.ndarray,
+    quota_view: QuotaView,
+    static: StaticConfig,
+) -> tuple[BanditState, jnp.ndarray, float | jnp.ndarray, Diagnostics]:
+    _compile_count["select"] += 1
+    return _select_pure(state, x, quota_view, static)
+
+
+def _update_traced(
+    state: BanditState,
+    x: jnp.ndarray,
+    arm: int | jnp.ndarray,
+    reward: float | jnp.ndarray,
+    static: StaticConfig,
+) -> BanditState:
+    _compile_count["update"] += 1
+    return _update_pure(state, x, arm, reward, static)
+
+
 select = _select_pure
-select_jit = jax.jit(_select_pure, static_argnums=(3,))
+select_jit = jax.jit(_select_traced, static_argnums=(3,))
 
 update = _update_pure
-update_jit = jax.jit(_update_pure, static_argnums=(4,))
+update_jit = jax.jit(_update_traced, static_argnums=(4,))

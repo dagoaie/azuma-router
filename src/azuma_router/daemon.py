@@ -6,6 +6,7 @@ Complies with contract §3.8, §5, FR-29..FR-33, ADR-0010, ADR-0013, ADR-0014.
 import argparse
 import datetime
 import json
+import math
 import secrets
 import signal
 import sys
@@ -15,13 +16,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO
 
-import jax.numpy as jnp
 import numpy as np
 
 from azuma_router.config import Config, load_config, to_static_config
 from azuma_router.errors import (
     ConfigError,
     InvalidContextError,
+    JournalWriteError,
     RpcError,
 )
 from azuma_router.featurizer import FEATURIZER_VERSION, featurize
@@ -33,13 +34,15 @@ from azuma_router.snapshot import (
     restore_snapshot,
     write_snapshot,
 )
-from azuma_router.state import init_state
+from azuma_router.state import (
+    init_state,
+    make_quota_view,
+    make_warmup_inputs,
+    to_jax_array,
+)
 from azuma_router.types import (
-    F32,
-    F64,
     BanditState,
     Pending,
-    QuotaView,
     RoutingRequest,
     SnapshotMeta,
 )
@@ -54,6 +57,97 @@ def uuid7() -> str:
     high = (ts_ms << 16) | (0x7 << 12) | rand_a
     low = (0x2 << 62) | rand_b
     return str(uuid.UUID(int=(high << 64) | low))
+
+
+def _log_event(
+    stream: TextIO,
+    level: str,
+    event: str,
+    timestamp: float | None = None,
+    **fields: Any,
+) -> None:
+    now = timestamp if timestamp is not None else time.time()
+    payload = {
+        "ts": now,
+        "level": level,
+        "event": event,
+        **fields,
+    }
+    stream.write(json.dumps(payload, allow_nan=False) + "\n")
+    stream.flush()
+
+
+def _check_finite_float(
+    val: Any,
+    field_name: str,
+    min_val: float | None = None,
+    max_val: float | None = None,
+) -> float:
+    if val is None or isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise RpcError(-32602, f"{field_name} must be numeric", data={"field": field_name})
+    fval = float(val)
+    if not math.isfinite(fval):
+        raise RpcError(-32602, f"{field_name} must be finite", data={"field": field_name})
+    if min_val is not None and fval < min_val:
+        raise RpcError(-32602, f"{field_name} must be >= {min_val}", data={"field": field_name})
+    if max_val is not None and fval > max_val:
+        raise RpcError(-32602, f"{field_name} must be <= {max_val}", data={"field": field_name})
+    return fval
+
+
+def _check_non_neg_int(val: Any, field_name: str) -> int:
+    if val is None or isinstance(val, bool) or not isinstance(val, int):
+        raise RpcError(-32602, f"{field_name} must be int >= 0", data={"field": field_name})
+    if val < 0:
+        raise RpcError(-32602, f"{field_name} must be int >= 0", data={"field": field_name})
+    return val
+
+
+def _build_allowed_mask(allowed_list: Any, config: Config) -> list[bool]:
+    k_max = config.bandit.k_max
+    allowed_mask = [False] * k_max
+    all_arm_ids = [arm.arm_id for arm in config.arms]
+
+    if allowed_list is not None:
+        if not isinstance(allowed_list, list):
+            raise RpcError(-32602, "allowed_arms must be a list", data={"field": "allowed_arms"})
+        for item in allowed_list:
+            if not isinstance(item, str) or item not in all_arm_ids:
+                raise RpcError(
+                    -32602,
+                    f"Unknown arm in allowed_arms: {item!r}",
+                    data={"field": f"allowed_arms[{item}]"},
+                )
+        for i, arm_id in enumerate(all_arm_ids):
+            allowed_mask[i] = arm_id in allowed_list
+    else:
+        for i in range(len(all_arm_ids)):
+            allowed_mask[i] = True
+
+    return allowed_mask
+
+
+def _build_select_diagnostics(
+    arms: tuple[Any, ...],
+    diag: Any,
+    util_matrix: np.ndarray,
+    est_units_arr: np.ndarray,
+) -> dict[str, Any]:
+    return {
+        "score": {arm.arm_id: float(diag.score[i]) for i, arm in enumerate(arms)},
+        "exploit": {arm.arm_id: float(diag.exploit[i]) for i, arm in enumerate(arms)},
+        "bonus": {arm.arm_id: float(diag.bonus[i]) for i, arm in enumerate(arms)},
+        "shadow_price": {arm.arm_id: float(diag.shadow_price[i]) for i, arm in enumerate(arms)},
+        "policy": {arm.arm_id: float(diag.policy[i]) for i, arm in enumerate(arms)},
+        "utilization": {
+            arm.arm_id: {
+                f"{w.kind}:{w.duration_s or w.period}": float(util_matrix[i, j])
+                for j, w in enumerate(arm.windows)
+            }
+            for i, arm in enumerate(arms)
+        },
+        "est_units": {arm.arm_id: float(est_units_arr[i]) for i, arm in enumerate(arms)},
+    }
 
 
 class Router:
@@ -111,7 +205,7 @@ class Router:
                                         "Active WAL exists with state_version > 0 "
                                         "but no snapshot/ directory"
                                     )
-                                    sys.stderr.write(f"[ERROR] {msg}\n")
+                                    _log_event(sys.stderr, "error", "wal_inconsistent", error=msg)
                                     sys.exit(3)
                             except Exception:
                                 pass
@@ -130,9 +224,10 @@ class Router:
                 rotated_path=rotated_path if rotated_path.exists() else None,
                 snapshot_state_version=self.state_version,
                 config=self.config,
+                ledger=self.ledger,
             )
         except ValueError as err:
-            sys.stderr.write(f"[ERROR] Replay failed: {err}\n")
+            _log_event(sys.stderr, "error", "replay_failed", error=str(err))
             sys.exit(3)
 
         self.pending_store = p_store
@@ -141,7 +236,7 @@ class Router:
         for s_ver, x_arr, arm_idx, reward in applied_reports:
             self.state = update_jit(
                 self.state,
-                jnp.array(x_arr, dtype=F64),
+                to_jax_array(x_arr),
                 arm_idx,
                 reward,
                 self.static,
@@ -154,12 +249,7 @@ class Router:
         # 4. Warm-up JIT: triggers both compilations; results are discarded so the
         # dummy pull never touches n_pulls or rng_key (D16).
         t_start = time.perf_counter()
-        dummy_x = jnp.zeros(32, dtype=F64)
-        dummy_qv = QuotaView(
-            utilization=jnp.zeros((self.static.k_max, self.static.w_max), dtype=F32),
-            est_units=jnp.zeros(self.static.k_max, dtype=F32),
-            allowed=jnp.ones(self.static.k_max, dtype=bool),
-        )
+        dummy_x, dummy_qv = make_warmup_inputs(self.static)
 
         warm_state, _, _, _ = select_jit(self.state, dummy_x, dummy_qv, self.static)
         warm_state = update_jit(warm_state, dummy_x, 0, 0.0, self.static)
@@ -167,6 +257,14 @@ class Router:
         warmup_ms = (time.perf_counter() - t_start) * 1000.0
 
         self.ready = True
+
+        _log_event(
+            sys.stderr,
+            "info",
+            "ready",
+            state_version=self.state_version,
+            warmup_ms=warmup_ms,
+        )
 
         return {
             "state_version": self.state_version,
@@ -178,14 +276,13 @@ class Router:
 
     def _check_clock_skew(self, now: float) -> None:
         if now < self.last_ts - 1.0:
-            skew_log = {
-                "ts": now,
-                "level": "warning",
-                "event": "clock_skew",
-                "delta_s": now - self.last_ts,
-            }
-            sys.stderr.write(json.dumps(skew_log) + "\n")
-            sys.stderr.flush()
+            _log_event(
+                sys.stderr,
+                "warning",
+                "clock_skew",
+                timestamp=now,
+                delta_s=now - self.last_ts,
+            )
         self.last_ts = now
 
     def _sweep_expired(self) -> None:
@@ -193,6 +290,15 @@ class Router:
         now = self.clock()
         self._check_clock_skew(now)
         expired = self.pending_store.sweep(now, self.config.bandit.pending_ttl_s)
+        if expired:
+            _log_event(
+                sys.stderr,
+                "info",
+                "pending_expired",
+                timestamp=now,
+                count=len(expired),
+                decision_ids=[p.decision_id for p in expired],
+            )
         for p in expired:
             if self.dlog is not None:
                 self.dlog.append(
@@ -223,9 +329,9 @@ class Router:
                 task_kind=req_raw.get("task_kind"),  # type: ignore[arg-type]
                 input_tokens=req_raw.get("input_tokens", -1),
                 expected_output_tokens=req_raw.get("expected_output_tokens"),
-                has_code=bool(req_raw.get("has_code", False)),
-                has_tools=bool(req_raw.get("has_tools", False)),
-                has_images=bool(req_raw.get("has_images", False)),
+                has_code=req_raw.get("has_code", False),
+                has_tools=req_raw.get("has_tools", False),
+                has_images=req_raw.get("has_images", False),
                 agent_depth=req_raw.get("agent_depth", 0),
                 diff_lines=req_raw.get("diff_lines"),
                 priority=req_raw.get("priority", "normal"),
@@ -237,27 +343,7 @@ class Router:
 
         # Allowed arms mask
         k_max = self.static.k_max
-        allowed_list = params.get("allowed_arms")
-        allowed_mask = [False] * k_max
-
-        all_arm_ids = [arm.arm_id for arm in self.config.arms]
-        if allowed_list is not None:
-            if not isinstance(allowed_list, list):
-                raise RpcError(
-                    -32602, "allowed_arms must be a list", data={"field": "allowed_arms"}
-                )
-            for item in allowed_list:
-                if not isinstance(item, str) or item not in all_arm_ids:
-                    raise RpcError(
-                        -32602,
-                        f"Unknown arm in allowed_arms: {item!r}",
-                        data={"field": f"allowed_arms[{item}]"},
-                    )
-            for i, arm_id in enumerate(all_arm_ids):
-                allowed_mask[i] = arm_id in allowed_list
-        else:
-            for i in range(len(all_arm_ids)):
-                allowed_mask[i] = True
+        allowed_mask = _build_allowed_mask(params.get("allowed_arms"), self.config)
 
         # est_units
         est_units_arr = np.zeros(k_max, dtype=np.float32)
@@ -267,21 +353,19 @@ class Router:
 
         util_matrix = self.ledger.utilization(now)
 
-        qv = QuotaView(
-            utilization=jnp.array(util_matrix, dtype=F32),
-            est_units=jnp.array(est_units_arr, dtype=F32),
-            allowed=jnp.array(allowed_mask, dtype=bool),
-        )
+        qv = make_quota_view(util_matrix, est_units_arr, allowed_mask)
 
-        x_jax = jnp.array(x_np, dtype=F64)
-        self.state, arm_idx, propensity, diag = select_jit(self.state, x_jax, qv, self.static)
+        x_jax = to_jax_array(x_np)
+        state_next, arm_idx, propensity, diag = select_jit(self.state, x_jax, qv, self.static)
 
         # Abort if non-finite scores outside JIT
         n_arms = len(self.config.arms)
         active_scores = np.array(diag.score[:n_arms])
         policy_active = np.array(diag.policy[:n_arms]) > 0
         if not np.all(np.isfinite(np.where(policy_active, active_scores, 0.0))):
-            sys.stderr.write("[ERROR] Non-finite score detected in select\n")
+            _log_event(
+                sys.stderr, "error", "non_finite_score", error="Non-finite score detected in select"
+            )
             sys.exit(4)
 
         if bool(diag.no_arm_available):
@@ -301,13 +385,12 @@ class Router:
         d_id = uuid7()
         est_u = float(est_units_arr[arm_i])
 
-        eid = self.ledger.record(chosen_arm.arm_id, est_u, now)
-
-        # Write WAL line select BEFORE returning (FR-20)
+        # Write WAL line select BEFORE mutating state/ledger (FR-20 / MF-2)
         util_dict = {
             arm.arm_id: util_matrix[idx, : len(arm.windows)].tolist()
             for idx, arm in enumerate(self.config.arms)
         }
+        score_logged = np.where(np.array(diag.policy) > 0, np.array(diag.score), -1e9)
         select_entry = {
             "phase": "select",
             "decision_id": d_id,
@@ -319,7 +402,7 @@ class Router:
             "alpha": self.static.alpha,
             "x": x_np.tolist(),
             "policy": np.array(diag.policy).tolist(),
-            "score": np.array(diag.score).tolist(),
+            "score": score_logged.tolist(),
             "exploit": np.array(diag.exploit).tolist(),
             "bonus": np.array(diag.bonus).tolist(),
             "shadow_price": np.array(diag.shadow_price).tolist(),
@@ -329,6 +412,10 @@ class Router:
         }
         if self.dlog is not None:
             self.dlog.append(select_entry)
+
+        # Mutate ledger and state only AFTER WAL append succeeds
+        eid = self.ledger.record(chosen_arm.arm_id, est_u, now)
+        self.state = state_next
 
         pending = Pending(
             decision_id=d_id,
@@ -354,25 +441,9 @@ class Router:
         }
 
         if params.get("verbose", True):
-            arms = self.config.arms
-            diag_dict = {
-                "score": {arm.arm_id: float(diag.score[i]) for i, arm in enumerate(arms)},
-                "exploit": {arm.arm_id: float(diag.exploit[i]) for i, arm in enumerate(arms)},
-                "bonus": {arm.arm_id: float(diag.bonus[i]) for i, arm in enumerate(arms)},
-                "shadow_price": {
-                    arm.arm_id: float(diag.shadow_price[i]) for i, arm in enumerate(arms)
-                },
-                "policy": {arm.arm_id: float(diag.policy[i]) for i, arm in enumerate(arms)},
-                "utilization": {
-                    arm.arm_id: {
-                        f"{w.kind}:{w.duration_s or w.period}": float(util_matrix[i, j])
-                        for j, w in enumerate(arm.windows)
-                    }
-                    for i, arm in enumerate(arms)
-                },
-                "est_units": {arm.arm_id: float(est_units_arr[i]) for i, arm in enumerate(arms)},
-            }
-            res["diagnostics"] = diag_dict
+            res["diagnostics"] = _build_select_diagnostics(
+                self.config.arms, diag, util_matrix, est_units_arr
+            )
 
         return res
 
@@ -385,38 +456,55 @@ class Router:
         if not isinstance(d_id, str):
             raise RpcError(-32602, "Missing decision_id", data={"field": "decision_id"})
 
-        quality = params.get("quality")
-        if quality is None or not isinstance(quality, float | int) or isinstance(quality, bool):
-            msg = "quality must be float in [0, 1]"
-            raise RpcError(-32602, msg, data={"field": "quality"})
-        quality_val = float(quality)
-        if not (0.0 <= quality_val <= 1.0):
-            msg = "quality must be float in [0, 1]"
-            raise RpcError(-32602, msg, data={"field": "quality"})
+        quality_val = _check_finite_float(
+            params.get("quality"), "quality", min_val=0.0, max_val=1.0
+        )
+        cost_val = _check_finite_float(params.get("cost_usd", 0.0), "cost_usd", min_val=0.0)
+        lat_val = _check_finite_float(params.get("latency_s", 0.0), "latency_s", min_val=0.0)
 
-        cost_usd = params.get("cost_usd", 0.0)
-        if not isinstance(cost_usd, float | int) or float(cost_usd) < 0.0:
-            raise RpcError(-32602, "cost_usd must be >= 0", data={"field": "cost_usd"})
-        cost_val = float(cost_usd)
+        in_toks = _check_non_neg_int(params.get("actual_input_tokens", 0), "actual_input_tokens")
+        out_toks = _check_non_neg_int(params.get("actual_output_tokens", 0), "actual_output_tokens")
 
-        latency_s = params.get("latency_s", 0.0)
-        if not isinstance(latency_s, float | int) or float(latency_s) < 0.0:
-            raise RpcError(-32602, "latency_s must be >= 0", data={"field": "latency_s"})
-        lat_val = float(latency_s)
-
-        in_toks = params.get("actual_input_tokens", 0)
-        if not isinstance(in_toks, int) or in_toks < 0:
-            msg = "actual_input_tokens must be int >= 0"
-            raise RpcError(-32602, msg, data={"field": "actual_input_tokens"})
-
-        out_toks = params.get("actual_output_tokens", 0)
-        if not isinstance(out_toks, int) or out_toks < 0:
-            msg = "actual_output_tokens must be int >= 0"
-            raise RpcError(-32602, msg, data={"field": "actual_output_tokens"})
+        now = self.clock()
+        self._check_clock_skew(now)
 
         pending = self.pending_store.get(d_id)
-        if pending is None:
+        if pending is not None:
+            if (now - pending.ts_select) > self.config.bandit.pending_ttl_s:
+                self.pending_store.pop(d_id)
+                expired_at = pending.ts_select + float(self.config.bandit.pending_ttl_s)
+                self.pending_store.mark_expired(d_id, expired_at)
+                if self.dlog is not None:
+                    self.dlog.append(
+                        {
+                            "phase": "expire",
+                            "decision_id": d_id,
+                            "ts": now,
+                            "state_version": self.state_version,
+                            "ts_select": pending.ts_select,
+                        }
+                    )
+                raise RpcError(
+                    -32003,
+                    f"Decision expired: {d_id}",
+                    data={"expired_at": expired_at},
+                )
+        else:
+            if self.pending_store.is_expired(d_id):
+                expired_at = self.pending_store.get_expired_at(d_id) or 0.0
+                raise RpcError(
+                    -32003,
+                    f"Decision expired: {d_id}",
+                    data={"expired_at": expired_at},
+                )
             if self.pending_store.is_applied(d_id):
+                _log_event(
+                    sys.stderr,
+                    "info",
+                    "report_duplicate",
+                    decision_id=d_id,
+                    state_version=self.state_version,
+                )
                 return {
                     "applied": False,
                     "reason": "duplicate",
@@ -431,21 +519,16 @@ class Router:
             msg = "cost_usd must be 0 for subscription arms"
             raise RpcError(-32602, msg, data={"field": "cost_usd"})
 
-        now = self.clock()
-        self._check_clock_skew(now)
         actual_units = calc_est_units(arm, in_toks, out_toks)
-        self.ledger.correct(pending.ledger_event_id, arm.arm_id, actual_units)
-
         reward = compute_reward(quality_val, cost_val, lat_val, self.static)
 
-        # State version is incremented BEFORE writing report WAL line (FR-21)
-        self.state_version += 1
+        next_state_version = self.state_version + 1
 
         report_entry = {
             "phase": "report",
             "decision_id": d_id,
             "ts": now,
-            "state_version": self.state_version,
+            "state_version": next_state_version,
             "quality": quality_val,
             "cost_usd": cost_val,
             "latency_s": lat_val,
@@ -454,10 +537,13 @@ class Router:
             "reward": reward,
             "actual_units": actual_units,
         }
+        # FR-21 exact order: append WAL line FIRST (with next state_version)
         if self.dlog is not None:
             self.dlog.append(report_entry)
 
-        x_jax = jnp.array(pending.x, dtype=F64)
+        self.ledger.correct(pending.ledger_event_id, arm.arm_id, actual_units)
+        self.state_version = next_state_version
+        x_jax = to_jax_array(pending.x)
         self.state = update_jit(self.state, x_jax, pending.arm_index, reward, self.static)
 
         self.pending_store.pop(d_id)
@@ -482,6 +568,9 @@ class Router:
 
     def snapshot(self, params: dict[str, Any]) -> dict[str, Any]:
         """Barries expired and writes state snapshot (FR-25, FR-28)."""
+        if not self.ready:
+            raise RpcError(-32005, "Daemon not ready")
+
         now = self.clock()
         expired = self.pending_store.sweep(now, self.config.bandit.pending_ttl_s)
         for p in expired:
@@ -511,6 +600,16 @@ class Router:
         target_path, n_bytes = write_snapshot(self.snapshot_dir, self.state, self.ledger, meta)
         self.updates_since_snapshot = 0
         self.last_snapshot_ts = now
+
+        _log_event(
+            sys.stderr,
+            "info",
+            "snapshot_written",
+            timestamp=now,
+            state_version=self.state_version,
+            path=str(target_path),
+            bytes=n_bytes,
+        )
 
         return {
             "state_version": self.state_version,
@@ -544,14 +643,72 @@ class Router:
             "jit_compilations": dict(_compile_count),
         }
 
-    def close(self) -> None:
+    def close(self) -> int:
+        exit_code = 0
         if self.ready:
             try:
                 self.snapshot({})
-            except Exception:
-                pass
+            except Exception as err:
+                _log_event(
+                    sys.stderr,
+                    "error",
+                    "shutdown_snapshot_failed",
+                    error=str(err),
+                    state_version=self.state_version,
+                )
+                exit_code = 4
         if self.dlog is not None:
-            self.dlog.close()
+            try:
+                self.dlog.close()
+            except Exception as err:
+                _log_event(
+                    sys.stderr,
+                    "error",
+                    "shutdown_dlog_close_failed",
+                    error=str(err),
+                )
+                exit_code = 4
+        return exit_code
+
+
+def _read_line_bounded(stream: Any, limit: int = 1048576) -> tuple[str | None, bool]:
+    """Reads line up to limit bytes from stream. Drains remainder if oversized."""
+    buf = getattr(stream, "buffer", stream)
+    if hasattr(buf, "readline"):
+        raw = buf.readline(limit + 1)
+        if not raw:
+            return None, False
+        raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
+        if len(raw_bytes) > limit:
+            while True:
+                chunk = buf.readline(4096)
+                if not chunk:
+                    break
+                chunk_bytes = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+                if b"\n" in chunk_bytes:
+                    break
+            return None, True
+        return raw_bytes.decode("utf-8", errors="replace"), False
+    else:
+        line = stream.readline()
+        if not line:
+            return None, False
+        line_bytes = line.encode("utf-8")
+        if len(line_bytes) > limit:
+            return None, True
+        return line, False
+
+
+def _dispatch_rpc_method(router: Router, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    if method == "select":
+        return router.select(params)
+    if method == "report":
+        return router.report(params)
+    if method == "snapshot":
+        return router.snapshot(params)
+    if method == "health":
+        return router.health(params)
+    raise RpcError(-32601, f"Method not found: {method}")
 
 
 def serve(
@@ -563,18 +720,14 @@ def serve(
 ) -> None:
     """Reads JSON-RPC 2.0 requests line by line from stdin and writes to stdout (FR-29)."""
     while True:
-        line = stdin.readline()
-        if not line:
+        line_str, is_too_long = _read_line_bounded(stdin, limit=1048576)
+        if line_str is None and not is_too_long:
+            code = router.close()
             if exit_on_eof:
-                router.close()
-                sys.exit(0)
+                sys.exit(code)
             break
 
-        line_str = line.strip()
-        if not line_str:
-            continue
-
-        if len(line) > 1048576:
+        if is_too_long:
             err_resp = {
                 "jsonrpc": "2.0",
                 "id": None,
@@ -588,8 +741,11 @@ def serve(
             stdout.flush()
             continue
 
+        if not line_str or not line_str.strip():
+            continue
+
         try:
-            payload = json.loads(line_str)
+            payload = json.loads(line_str.strip())
         except Exception:
             err_resp = {
                 "jsonrpc": "2.0",
@@ -627,22 +783,17 @@ def serve(
         params = payload.get("params", {})
 
         try:
-            if method == "select":
-                result = router.select(params)
-            elif method == "report":
-                result = router.report(params)
-            elif method == "snapshot":
-                result = router.snapshot(params)
-            elif method == "health":
-                result = router.health(params)
-            else:
-                raise RpcError(-32601, f"Method not found: {method}")
+            result = _dispatch_rpc_method(router, method, params)
 
             if req_id is not None:
                 resp = {"jsonrpc": "2.0", "id": req_id, "result": result}
                 stdout.write(json.dumps(resp) + "\n")
                 stdout.flush()
 
+        except JournalWriteError as err:
+            _log_event(stderr, "error", "journal_write_error", error=str(err))
+            code = router.close()
+            sys.exit(code or 4)
         except RpcError as err:
             err_obj: dict[str, Any] = {"code": err.code, "message": err.message}
             if err.data is not None:
@@ -653,11 +804,9 @@ def serve(
                 stdout.write(json.dumps(resp) + "\n")
                 stdout.flush()
             else:
-                stderr.write(f"[RPC Notification Error] {err_obj}\n")
-                stderr.flush()
+                _log_event(stderr, "error", "rpc_notification_error", error=err_obj)
         except Exception as err:
-            stderr.write(f"[Unhandled Error] {err}\n")
-            stderr.flush()
+            _log_event(stderr, "error", "unhandled_error", error=str(err))
             if req_id is not None:
                 resp = {
                     "jsonrpc": "2.0",
@@ -676,15 +825,15 @@ def main() -> None:
     try:
         cfg = load_config(args.config)
     except ConfigError as err:
-        sys.stderr.write(f"[ERROR] Config loading failed: {err}\n")
+        _log_event(sys.stderr, "error", "config_error", error=str(err))
         sys.exit(3)
 
     router = Router(cfg)
 
     def handle_signal(_sig: int, _frame: Any) -> None:
-        sys.stderr.write("[INFO] Received signal, shutting down cleanly...\n")
-        router.close()
-        sys.exit(0)
+        _log_event(sys.stderr, "info", "signal_received", signal=_sig)
+        code = router.close()
+        sys.exit(code)
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)

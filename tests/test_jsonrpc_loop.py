@@ -47,15 +47,21 @@ def test_jsonrpc_loop_framing_and_errors(tmp_path: Path) -> None:
     router = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
     router.boot()
 
-    # 1. Line > 1 MiB -> -32600 line_too_long
+    # 1. Line > 1 MiB -> -32600 line_too_long followed by valid request
     long_line = "a" * (1048576 + 10) + "\n"
-    stdin_long = io.StringIO(long_line)
+    valid_line = '{"jsonrpc":"2.0","id":99,"method":"health"}\n'
+    stdin_long = io.StringIO(long_line + valid_line)
     stdout_long = io.StringIO()
     stderr_long = io.StringIO()
     serve(stdin_long, stdout_long, stderr_long, router, exit_on_eof=False)
-    out_long = json.loads(stdout_long.getvalue().strip())
+    out_lines = stdout_long.getvalue().strip().splitlines()
+    assert len(out_lines) == 2
+    out_long = json.loads(out_lines[0])
     assert out_long["error"]["code"] == -32600
     assert out_long["error"]["data"]["reason"] == "line_too_long"
+    out_valid = json.loads(out_lines[1])
+    assert out_valid["id"] == 99
+    assert out_valid["result"]["ready"] is True
 
     # 2. Parse error -> -32700
     stdin_parse = io.StringIO("{invalid_json\n")

@@ -14,15 +14,41 @@ from azuma_router.types import StaticConfig
 
 def test_ope_same_policy_ac28() -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
-    static = to_static_config(cfg)
+    base_static = to_static_config(cfg)
+    logged_static = StaticConfig(
+        k_max=base_static.k_max,
+        w_max=base_static.w_max,
+        d=base_static.d,
+        ridge_lambda=base_static.ridge_lambda,
+        alpha=0.2,
+        tau=0.1,
+        epsilon_floor=0.02,
+        w_quality=base_static.w_quality,
+        w_cost=base_static.w_cost,
+        w_latency=base_static.w_latency,
+        cost_budget_usd=base_static.cost_budget_usd,
+        latency_budget_s=base_static.latency_budget_s,
+        barrier_mu=base_static.barrier_mu,
+        is_subscription=base_static.is_subscription,
+    )
     log_path = Path("fixtures/ope/decisions.jsonl")
 
-    res = evaluate(log_path, static)
+    res = evaluate(log_path, logged_static)
 
-    assert res["n"] == 2
-    np.testing.assert_allclose(res["ips"], 0.8253, rtol=0.02, atol=0.02)
-    np.testing.assert_allclose(res["dr"], 0.8253, rtol=0.02, atol=0.02)
-    assert res["ess"] > 0.0
+    # Read mean logged reward from reports
+    rewards = []
+    with log_path.open() as f:
+        for line in f:
+            data = json.loads(line)
+            if data.get("phase") == "report":
+                rewards.append(data["reward"])
+
+    mean_reward = float(np.mean(rewards))
+
+    assert res["n"] == 500
+    np.testing.assert_allclose(res["ips"], mean_reward, rtol=0.02, atol=0.02)
+    np.testing.assert_allclose(res["dr"], mean_reward, rtol=0.02, atol=0.02)
+    assert res["ess"] == 500.0
 
 
 def test_ope_different_policy() -> None:
@@ -30,15 +56,14 @@ def test_ope_different_policy() -> None:
     base_static = to_static_config(cfg)
     log_path = Path("fixtures/ope/decisions.jsonl")
 
-    # Candidate with different alpha and epsilon_floor
-    cand_static = StaticConfig(
+    logged_static = StaticConfig(
         k_max=base_static.k_max,
         w_max=base_static.w_max,
         d=base_static.d,
         ridge_lambda=base_static.ridge_lambda,
-        alpha=5.0,
+        alpha=0.2,
         tau=0.1,
-        epsilon_floor=0.5,
+        epsilon_floor=0.02,
         w_quality=base_static.w_quality,
         w_cost=base_static.w_cost,
         w_latency=base_static.w_latency,
@@ -48,8 +73,31 @@ def test_ope_different_policy() -> None:
         is_subscription=base_static.is_subscription,
     )
 
-    res = evaluate(log_path, cand_static)
-    assert res["n"] == 2
+    # Candidate with different alpha
+    cand_static = StaticConfig(
+        k_max=base_static.k_max,
+        w_max=base_static.w_max,
+        d=base_static.d,
+        ridge_lambda=base_static.ridge_lambda,
+        alpha=2.0,
+        tau=0.1,
+        epsilon_floor=0.02,
+        w_quality=base_static.w_quality,
+        w_cost=base_static.w_cost,
+        w_latency=base_static.w_latency,
+        cost_budget_usd=base_static.cost_budget_usd,
+        latency_budget_s=base_static.latency_budget_s,
+        barrier_mu=base_static.barrier_mu,
+        is_subscription=base_static.is_subscription,
+    )
+
+    res_logged = evaluate(log_path, logged_static)
+    res_cand = evaluate(log_path, cand_static)
+
+    assert res_cand["n"] == 500
+    assert res_cand["ips"] != res_logged["ips"]
+    assert res_cand["dr"] != res_logged["dr"]
+    assert res_cand["ess"] < res_cand["n"]
 
 
 def test_ope_orphan_report(tmp_path: Path) -> None:

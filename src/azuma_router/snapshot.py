@@ -8,16 +8,16 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
-import jax.numpy as jnp
-import numpy as np
 from safetensors.numpy import load_file, save_file
 
 from azuma_router.config import Config
 from azuma_router.errors import IncompatibleSnapshotError
 from azuma_router.quota import QuotaLedger
-from azuma_router.types import F64, I32, U32, BanditState, SnapshotMeta
+from azuma_router.state import state_from_numpy, state_to_numpy
+from azuma_router.types import BanditState, SnapshotMeta
 
 
 def compute_config_sha256(config_path_or_str: str | Path | Config) -> str:
@@ -61,13 +61,7 @@ def write_snapshot(
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. state.safetensors
-    tensor_dict: dict[str, np.ndarray] = {
-        "A": np.array(state.A, dtype=np.float64),
-        "b": np.array(state.b, dtype=np.float64),
-        "n_pulls": np.array(state.n_pulls, dtype=np.int32),
-        "mask": np.array(state.mask, dtype=bool),
-        "rng_key": np.array(state.rng_key, dtype=np.uint32),
-    }
+    tensor_dict = state_to_numpy(state)
 
     tensor_path = tmp_dir / "state.safetensors"
     save_file(tensor_dict, str(tensor_path))
@@ -104,6 +98,28 @@ def write_snapshot(
         shutil.rmtree(old_dir)
 
     return target_dir, total_bytes
+
+
+def _validate_snapshot_compatibility(meta: SnapshotMeta, config: Config) -> None:
+    """Performs fail-fast shape and version checks against running Config (FR-26)."""
+    expected_arm_ids = [arm.arm_id for arm in config.arms]
+    if meta.schema_version != 1:
+        raise IncompatibleSnapshotError(f"Unsupported schema_version: {meta.schema_version}")
+    if meta.featurizer_version != 1:
+        msg = f"Unsupported featurizer_version: {meta.featurizer_version}"
+        raise IncompatibleSnapshotError(msg)
+    if meta.static.d != config.bandit.d:
+        msg = f"d mismatch: snapshot={meta.static.d}, config={config.bandit.d}"
+        raise IncompatibleSnapshotError(msg)
+    if meta.static.k_max != config.bandit.k_max:
+        msg = f"k_max mismatch: snapshot={meta.static.k_max}, config={config.bandit.k_max}"
+        raise IncompatibleSnapshotError(msg)
+    if meta.static.w_max != config.bandit.w_max:
+        msg = f"w_max mismatch: snapshot={meta.static.w_max}, config={config.bandit.w_max}"
+        raise IncompatibleSnapshotError(msg)
+    if meta.arm_ids != expected_arm_ids:
+        msg = f"arm_ids mismatch: snapshot={meta.arm_ids}, config={expected_arm_ids}"
+        raise IncompatibleSnapshotError(msg)
 
 
 def restore_snapshot(
@@ -143,31 +159,19 @@ def restore_snapshot(
         raise IncompatibleSnapshotError(msg) from err
 
     # Fail-fast compatibility checks (FR-26)
-    expected_arm_ids = [arm.arm_id for arm in config.arms]
-    if meta.schema_version != 1:
-        raise IncompatibleSnapshotError(f"Unsupported schema_version: {meta.schema_version}")
-    if meta.featurizer_version != 1:
-        msg = f"Unsupported featurizer_version: {meta.featurizer_version}"
-        raise IncompatibleSnapshotError(msg)
-    if meta.static.d != config.bandit.d:
-        msg = f"d mismatch: snapshot={meta.static.d}, config={config.bandit.d}"
-        raise IncompatibleSnapshotError(msg)
-    if meta.static.k_max != config.bandit.k_max:
-        msg = f"k_max mismatch: snapshot={meta.static.k_max}, config={config.bandit.k_max}"
-        raise IncompatibleSnapshotError(msg)
-    if meta.static.w_max != config.bandit.w_max:
-        msg = f"w_max mismatch: snapshot={meta.static.w_max}, config={config.bandit.w_max}"
-        raise IncompatibleSnapshotError(msg)
-    if meta.arm_ids != expected_arm_ids:
-        msg = f"arm_ids mismatch: snapshot={meta.arm_ids}, config={expected_arm_ids}"
-        raise IncompatibleSnapshotError(msg)
+    _validate_snapshot_compatibility(meta, config)
 
     current_sha256 = compute_config_sha256(config)
     if meta.config_sha256 != current_sha256:
-        sys.stderr.write(
-            f"[WARNING] Snapshot config_sha256 ({meta.config_sha256[:8]}) differs "
-            f"from current config ({current_sha256[:8]}). Hyperparameters accepted.\n"
-        )
+        warn_payload = {
+            "ts": time.time(),
+            "level": "warning",
+            "event": "config_sha256_mismatch",
+            "snapshot_sha256": meta.config_sha256,
+            "current_sha256": current_sha256,
+        }
+        sys.stderr.write(json.dumps(warn_payload, allow_nan=False) + "\n")
+        sys.stderr.flush()
 
     # Load tensors
     try:
@@ -176,13 +180,7 @@ def restore_snapshot(
         msg = f"Failed to load safetensors file {tensor_path}: {err}"
         raise IncompatibleSnapshotError(msg) from err
 
-    state = BanditState(
-        A=jnp.array(tensors["A"], dtype=F64),
-        b=jnp.array(tensors["b"], dtype=F64),
-        n_pulls=jnp.array(tensors["n_pulls"], dtype=I32),
-        mask=jnp.array(tensors["mask"], dtype=bool),
-        rng_key=jnp.array(tensors["rng_key"], dtype=U32),
-    )
+    state = state_from_numpy(tensors)
 
     ledger = QuotaLedger.load(meta.ledger, config)
     return state, ledger, meta
