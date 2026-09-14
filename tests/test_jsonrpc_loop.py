@@ -89,4 +89,3 @@ def test_jsonrpc_loop_framing_and_errors(tmp_path: Path) -> None:
     assert stdout_notif.getvalue() == ""
 
     router.close()
-

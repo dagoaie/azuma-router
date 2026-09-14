@@ -25,10 +25,10 @@ w_latency = 0.2
 cost_budget_usd = 0.50
 latency_budget_s = 30.0
 pending_ttl_s = 3600
-snapshot_dir = "{(tmp_path / '.azuma').as_posix()}"
+snapshot_dir = "{(tmp_path / ".azuma").as_posix()}"
 snapshot_every_updates = 100
 snapshot_every_s = 30
-decision_log_path = "{(tmp_path / '.azuma' / 'decisions.jsonl').as_posix()}"
+decision_log_path = "{(tmp_path / ".azuma" / "decisions.jsonl").as_posix()}"
 decision_log_max_bytes = 268435456
 
 [[arms]]
