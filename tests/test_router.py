@@ -284,3 +284,23 @@ def test_clock_skew_warning(tmp_path: Path, capsys: pytest.CaptureFixture[str]) 
     captured = capsys.readouterr()
     assert "clock_skew" in captured.err
     router.close()
+
+
+def test_warmup_does_not_mutate_bandit_state(tmp_path: Path) -> None:
+    """Warm-up (D16) compiles select/update but must leave n_pulls untouched across boots."""
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    s_dir = tmp_path / ".azuma"
+    l_path = tmp_path / "decisions.jsonl"
+
+    r1 = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
+    r1.boot()
+    pulls_fresh = {arm: info["n_pulls"] for arm, info in r1.health({})["arms"].items()}
+    assert pulls_fresh == {"gpt-5-codex@openai-codex": 0, "qwen3-coder@openrouter": 0}
+    r1.close()
+
+    r2 = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
+    ready = r2.boot()
+    assert ready["restored_from_snapshot"] is True
+    pulls_restored = {arm: info["n_pulls"] for arm, info in r2.health({})["arms"].items()}
+    assert pulls_restored == pulls_fresh
+    r2.close()

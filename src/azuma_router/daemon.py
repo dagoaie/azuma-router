@@ -151,7 +151,8 @@ class Router:
         # 3. Open DecisionLog
         self.dlog = DecisionLog(self.decision_log_path, self.config.bandit.decision_log_max_bytes)
 
-        # 4. Warm-up JIT
+        # 4. Warm-up JIT: triggers both compilations; results are discarded so the
+        # dummy pull never touches n_pulls or rng_key (D16).
         t_start = time.perf_counter()
         dummy_x = jnp.zeros(32, dtype=F64)
         dummy_qv = QuotaView(
@@ -160,8 +161,9 @@ class Router:
             allowed=jnp.ones(self.static.k_max, dtype=bool),
         )
 
-        self.state, _, _, _ = select_jit(self.state, dummy_x, dummy_qv, self.static)
-        self.state = update_jit(self.state, dummy_x, 0, 0.0, self.static)
+        warm_state, _, _, _ = select_jit(self.state, dummy_x, dummy_qv, self.static)
+        warm_state = update_jit(warm_state, dummy_x, 0, 0.0, self.static)
+        warm_state.n_pulls.block_until_ready()  # measure real compile time, not dispatch
         warmup_ms = (time.perf_counter() - t_start) * 1000.0
 
         self.ready = True
@@ -368,9 +370,7 @@ class Router:
                     }
                     for i, arm in enumerate(arms)
                 },
-                "est_units": {
-                    arm.arm_id: float(est_units_arr[i]) for i, arm in enumerate(arms)
-                },
+                "est_units": {arm.arm_id: float(est_units_arr[i]) for i, arm in enumerate(arms)},
             }
             res["diagnostics"] = diag_dict
 
