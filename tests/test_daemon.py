@@ -1304,3 +1304,163 @@ def test_a_signal_during_report_is_deferred_until_the_request_completes(
     assert restarted.health({})["pending"] == 0
     assert restarted.health({})["state_version"] == 1
     restarted.close()
+
+
+def test_an_unexpected_failure_after_the_report_append_is_fatal_and_replayed_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Continuing with an advanced state_version and stale tensors would make the next
+    snapshot lie and replay skip a durable report (P5-MF-1)."""
+    router = _booted_router(tmp_path)
+    d_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+
+    def backend_failure(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("simulated backend failure")
+
+    monkeypatch.setattr(daemon_mod, "update_jit", backend_failure)
+    code, events = _serve_one_request(router, "report", _report_params(d_id))
+    monkeypatch.undo()
+
+    assert code == 4
+    assert [e["event"] for e in events if e["level"] == "error"] == ["journal_apply_error"]
+    assert not (tmp_path / ".azuma" / "snapshot").exists(), "no snapshot of an uncertain state"
+
+    restarted = _booted_router(tmp_path)
+    assert restarted.health({})["state_version"] == 1
+    assert restarted.health({})["pending"] == 0
+    assert float(restarted.state.n_pulls[0]) == 1.0, "the durable report was re-applied"
+    restarted.close()
+
+
+def test_restart_after_a_kill_before_the_first_snapshot_replays_from_the_initial_state(
+    tmp_path: Path,
+) -> None:
+    """A fresh daemon killed within its first snapshot cadence must come back (no false
+    `wal_inconsistent`): with no rotation, the journal is complete from state_version 1."""
+    router = _booted_router(tmp_path)
+    router.report(
+        _report_params(router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"])
+    )
+    router.dlog.close()  # type: ignore[union-attr]  # SIGKILL: no shutdown snapshot
+
+    restarted = _booted_router(tmp_path)
+
+    assert restarted.health({})["state_version"] == 1
+    assert float(restarted.state.n_pulls[0]) == 1.0
+    restarted.close()
+
+
+def test_boot_exits_3_when_replayed_reports_are_not_contiguous_after_the_snapshot(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A gap in state_version means updates were lost between snapshot and journal."""
+    router = _booted_router(tmp_path)
+    for _ in range(2):
+        d_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+        router.report(_report_params(d_id))
+    router.dlog.close()  # type: ignore[union-attr]
+    journal = tmp_path / "decisions.jsonl"
+    kept = [
+        line
+        for line in journal.read_text().splitlines()
+        if not (json.loads(line)["phase"] == "report" and json.loads(line)["state_version"] == 1)
+    ]
+    journal.write_text("\n".join(kept) + "\n")
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "replay_failed" in events
+
+
+def test_a_signal_during_a_fatal_close_is_ignored_and_never_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM landing while `close(with_snapshot=False)` runs must not start a second close
+    that takes the very snapshot the fatal path forbids (P5-MF-2)."""
+    router = _booted_router(tmp_path)
+    d_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    stderr = io.StringIO()
+    shutdown = ShutdownCoordinator(router, stderr)
+
+    def backend_failure(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated backend failure")
+
+    monkeypatch.setattr(daemon_mod, "update_jit", backend_failure)
+    real_close, close_calls = router.close, []
+
+    def counting_close(*, with_snapshot: bool = True) -> int:
+        close_calls.append(with_snapshot)
+        return real_close(with_snapshot=with_snapshot)
+
+    assert router.dlog is not None
+    real_dlog_close = router.dlog.close
+
+    def dlog_close_with_signal_landing_inside() -> None:
+        shutdown.on_signal(signal.SIGTERM, None)  # mid-close, after the snapshot decision
+        real_dlog_close()
+
+    monkeypatch.setattr(router, "close", counting_close)
+    monkeypatch.setattr(router.dlog, "close", dlog_close_with_signal_landing_inside)
+    request = {"jsonrpc": "2.0", "id": 1, "method": "report", "params": _report_params(d_id)}
+    stdin = io.StringIO(json.dumps(request) + "\n")
+
+    with pytest.raises(SystemExit) as exit_info:
+        serve(stdin, io.StringIO(), stderr, router, exit_on_eof=False, shutdown=shutdown)
+
+    assert exit_info.value.code == 4
+    assert close_calls == [False]
+    assert not (tmp_path / ".azuma" / "snapshot").exists()
+    events = [json.loads(line)["event"] for line in stderr.getvalue().splitlines()]
+    assert events == ["journal_apply_error", "signal_received"]
+
+
+def test_main_exits_3_when_the_config_file_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    unreadable = tmp_path / "azuma.toml"
+    unreadable.write_text('schema_version = "1"\n')
+    unreadable.chmod(0o000)
+    monkeypatch.setattr(sys, "argv", ["azuma-router", "--config", str(unreadable)])
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main()
+
+    assert exit_info.value.code == 3
+    assert [json.loads(line)["event"] for line in stderr.getvalue().splitlines()] == [
+        "config_error"
+    ]
+
+
+def test_boot_exits_3_when_the_snapshot_ledger_is_malformed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A snapshot whose ledger does not decode is incompatible, not a KeyError (P5-MF-3)."""
+    meta_path = _snapshot_meta_path(tmp_path)
+    meta = json.loads(meta_path.read_text())
+    meta["ledger"] = {"events": {CODEX: [{"bogus": 1}]}, "next_event_id": 0}
+    meta_path.write_text(json.dumps(meta))
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "incompatible_snapshot" in events
+
+
+def test_per_token_ledger_events_are_pruned_once_no_pending_can_correct_them(
+    tmp_path: Path,
+) -> None:
+    """Per-token arms have no windows but their events must still expire after pending_ttl_s
+    or every select leaks into memory and the snapshot forever (P5-MF-4)."""
+    per_token_arm = "qwen3-coder@openrouter"
+    clock = [1_700_000_000.0]
+    router = _booted_router(tmp_path, clock_fn=lambda: clock[0])
+    for _ in range(5):
+        d_id = router.select({"request": REQUEST, "allowed_arms": [per_token_arm]})["decision_id"]
+        router.report(_report_params(d_id))
+        clock[0] += 2 * 3600  # twice pending_ttl_s: no live pending can reference older events
+
+    assert len(router.ledger.dump()["events"][per_token_arm]) == 1
+    router.close()

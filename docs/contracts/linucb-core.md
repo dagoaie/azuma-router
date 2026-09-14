@@ -46,7 +46,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 ### 3.4 Cuota y precio sombra (ADR-0005, 0006, 0011)
 - **FR-14** `QuotaLedger.record(arm_id, units, ts)` y `QuotaLedger.utilization(now) -> f32[K_max, W_max]` DEBEN dar `u = consumido_en_ventana / capacity`, con `RollingWindow` (últimos `duration_s`) y `FixedResetWindow` (desde el último `reset_anchor`).
 - **FR-15** `u ≥ 1.0` en cualquier ventana ⇒ el brazo DEBE quedar enmascarado en la `QuotaView` de ese `select`.
-- **FR-15b** El ledger DEBE retener cada evento al menos `max(duración de la ventana más larga del brazo, pending_ttl_s)` para que `correct` en `report` siempre encuentre su `ledger_event_id`; un `report` cuyo evento no existe es una violación de invariante ⇒ `ledger_integrity_error`, salida código 4 **antes** de escribir la línea `report`.
+- **FR-15b** El ledger DEBE retener cada evento al menos `max(duración de la ventana más larga del brazo, pending_ttl_s)` (para brazos `per_token`, sin ventanas: `pending_ttl_s`) y podar los más antiguos en cada `utilization` para todo brazo, para que `correct` en `report` siempre encuentre su `ledger_event_id`; un `report` cuyo evento no existe es una violación de invariante ⇒ `ledger_integrity_error`, salida código 4 **antes** de escribir la línea `report`.
 - **FR-16** El consumo estimado (`est_units = units_per_request + units_per_1k_tokens·(input_tokens + expected_output_tokens)/1000`) DEBE anotarse en `select`; `report` DEBE reemplazarlo por el consumo real (`actual_*_tokens`) en el mismo evento del ledger (no sumar un segundo).
 - **FR-17** Brazos `per_token` DEBEN tener `shadow = 0` siempre.
 
@@ -324,17 +324,19 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 | `id` ausente en `select`/`report` (notificación) | Se procesa pero no se responde (semántica JSON-RPC); se registra en stderr. Un `"id": null` explícito **no** es notificación: se responde con `id: null`. |
 | `report` llega antes de que `select` haya hecho flush | Imposible: `select` responde solo tras flush (FR-20). |
 | Crash entre línea `select` y respuesta | Al arrancar, replay ve `select` sin `report`: pendiente; expirará o se reportará. |
-| Crash entre línea `report` y `update` aplicado | Replay reaplica `report` (línea existe, `state_version` del snapshot menor): `update` es idempotente por replay porque solo se reaplica si `state_version_line > snapshot.state_version`. |
+| Crash entre línea `report` y `update` aplicado | Replay reaplica `report` (línea existe, `state_version` del snapshot menor): `update` es idempotente por replay porque solo se reaplica si `state_version_line > snapshot.state_version`. Los `report` reaplicados DEBEN ser contiguos (`snapshot.state_version + 1, + 2, …`); un hueco ⇒ `replay_failed`, salida 3. |
+| Excepción inesperada tras escribir la línea `report` (`ledger.correct`, `update_jit`, `pending`) | La línea ya es durable: `journal_apply_error`, salida 4 **sin** snapshot; el replay al arrancar deja memoria y journal reconciliados. |
 | Snapshot `.tmp` residual al arrancar | Se borra; se restaura `snapshot/` si existe. |
-| `snapshot/` ausente | Estado inicial (FR-07); `ready.restored_from_snapshot = false`; WAL existente se **rechaza** si cualquiera de los dos segmentos (`decisions.jsonl`, `decisions.1.jsonl`) contiene `state_version > 0` (inconsistencia) ⇒ salida código 3; un segmento corrupto durante esa comprobación ⇒ `replay_failed`, salida 3. |
+| `snapshot/` ausente | Estado inicial (FR-07); `ready.restored_from_snapshot = false`; un `decisions.1.jsonl` presente sin `snapshot/` es inconsistente (la rotación siempre sigue a un snapshot) ⇒ `wal_inconsistent`, salida código 3; un `decisions.jsonl` sin rotar se reproduce íntegro desde el estado inicial (caso: kill antes del primer snapshot de cadencia). |
 | `arm_ids` del snapshot ≠ config | `IncompatibleSnapshotError`, salida código 3, mensaje con el diff de listas. |
-| Snapshot o WAL ilegibles (permisos, E/S) en arranque | `snapshot_read_failed` / `replay_failed` en stderr, salida código 3; nunca un traceback. |
+| Snapshot o WAL ilegibles (permisos, E/S) en arranque | `snapshot_read_failed` / `replay_failed` en stderr, salida código 3; nunca un traceback. Un `azuma.toml` ilegible ⇒ `config_error` (`file`), salida 3. |
+| Snapshot con tensores o ledger que no decodifican (tras pasar versión y formas) | `incompatible_snapshot`, salida código 3. |
 | `config_sha256` ≠ pero `arm_ids` y formas iguales (cambió `alpha`, pesos…) | Se acepta: hiperparámetros son valor, no forma; se anota `warning` en stderr. |
 | JSONL con línea corrupta al final (crash a mitad de escritura) | Replay descarta **solo la última línea** si no parsea; una línea corrupta no final ⇒ salida código 3. |
 | Rotación durante replay | No aplica: la rotación se evalúa tras cada `append` (`select`/`report`/`expire`) en servicio, nunca en replay; va precedida de snapshot y arrastra los `select` vivos al fichero nuevo. Los `expire` escritos al inicio de un `select` cuentan aunque ese `select` acabe rechazado. |
 | `NaN` en `A` (imposible por construcción) | `select` DEBE assert `jnp.isfinite(score).all()` fuera del JIT sobre `diagnostics`; fallo ⇒ excepción y salida código 4 (estado corrupto; no se hace snapshot). |
 | SIGTERM durante escritura de snapshot | El rename es atómico: o queda el anterior o el nuevo, nunca mixto. |
-| SIGTERM/SIGINT con una petición en curso | Se registra `signal_received` + `shutdown_deferred`; la petición responde y después se cierra (snapshot + exit). Una segunda señal durante el cierre se ignora. |
+| SIGTERM/SIGINT con una petición en curso | Se registra `signal_received` + `shutdown_deferred`; la petición responde y después se cierra (snapshot + exit). Toda señal que llegue con un cierre ya iniciado (ordenado o fatal) se ignora: nunca hay un segundo `close` ni un snapshot que el cierre fatal prohíbe. |
 | Fallo de E/S persistente (WAL abrir/escribir/rotar, snapshot) | `journal_write_error` ⇒ salida 4 **con** snapshot de cierre; `snapshot_write_error` ⇒ salida 4 sin reintentar el snapshot. Nunca se responde OK a una petición cuya línea no llegó al journal. |
 | Respuesta con `NaN`/`Infinity` (serialización) | Imposible por construcción (`allow_nan=False`); si ocurre ⇒ `numerical_integrity_error`, salida 4 sin snapshot. |
 | Reloj retrocede (NTP) | El ledger usa `time.time()`; un salto atrás puede rejuvenecer eventos; se acepta (ventanas se recuperan solas). Se registra `warning` si `now < last_ts − 1 s`. |

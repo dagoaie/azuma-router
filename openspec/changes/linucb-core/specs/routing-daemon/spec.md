@@ -74,7 +74,19 @@ Las peticiones SHALL procesarse una a una en orden de llegada en un único hilo;
 - **THEN** `health.state_version == 1`, `health.pending == 0` y `jit_compilations == {"select": 1, "update": 1}`
 
 ### Requirement: Apagado y fallos
-Ante EOF en `stdin`, `SIGTERM` o `SIGINT`, el daemon SHALL terminar la petición en curso, hacer snapshot y salir con código 0: una señal con petición en curso SHALL diferirse (`shutdown_deferred`) hasta que esa petición haya respondido, y una señal en reposo SHALL cerrar de inmediato. `IncompatibleSnapshotError` en arranque ⇒ `incompatible_snapshot` en stderr y código 3; snapshot o journal ilegibles ⇒ `snapshot_read_failed` / `replay_failed` y código 3, nunca un traceback. Excepción no controlada durante una petición ⇒ log en stderr, snapshot solo si el estado es finito, y código 4.
+Ante EOF en `stdin`, `SIGTERM` o `SIGINT`, el daemon SHALL terminar la petición en curso, hacer snapshot y salir con código 0: una señal con petición en curso SHALL diferirse (`shutdown_deferred`) hasta que esa petición haya respondido, y una señal en reposo SHALL cerrar de inmediato. `IncompatibleSnapshotError` en arranque ⇒ `incompatible_snapshot` en stderr y código 3; snapshot o journal ilegibles ⇒ `snapshot_read_failed` / `replay_failed` y código 3, `azuma.toml` ilegible ⇒ `config_error` y código 3, snapshot cuyos tensores o ledger no decodifican ⇒ `incompatible_snapshot` y código 3, nunca un traceback. Excepción no controlada durante una petición ⇒ log en stderr, snapshot solo si el estado es finito, y código 4. Una excepción tras escribir la línea `report` ⇒ `journal_apply_error`, código 4 **sin** snapshot (la línea es durable; el replay reconcilia). Toda señal recibida con un cierre ya iniciado SHALL ignorarse: nunca un segundo `close`.
+
+#### Scenario: fallo tras journalizar el report
+- **WHEN** `update_jit` lanza una excepción inesperada después de que la línea `report` esté en el journal
+- **THEN** stderr contiene `journal_apply_error`, el proceso sale con código 4 sin escribir `snapshot/`, y al relanzar `state_version == 1` con el `update` aplicado por replay
+
+#### Scenario: señal durante un cierre fatal
+- **WHEN** llega `SIGTERM` mientras se ejecuta el `close` sin snapshot de un fallo fatal
+- **THEN** solo hay un `close`, no se escribe `snapshot/` y el proceso sale con código 4
+
+#### Scenario: configuración ilegible
+- **WHEN** `--config` apunta a un fichero sin permiso de lectura
+- **THEN** stderr contiene `config_error` y el proceso sale con código 3
 
 #### Scenario: señal durante un report
 - **WHEN** llega `SIGTERM` mientras `report` está aplicando `update_jit`

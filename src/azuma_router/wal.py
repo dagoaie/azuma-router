@@ -218,6 +218,13 @@ def _replay_report(entry: dict[str, Any], rs: _ReplayState) -> None:
     state_version = int(entry["state_version"])
     if state_version <= rs.snapshot_state_version:
         return
+    expected = rs.snapshot_state_version + len(rs.applied_reports) + 1
+    if state_version != expected:
+        msg = (
+            f"WAL report for decision {d_id} has state_version {state_version}; "
+            f"expected {expected} (updates missing between snapshot and journal)"
+        )
+        raise ValueError(msg)
     if rs.ledger is not None:
         try:
             rs.ledger.correct(
@@ -244,19 +251,6 @@ _PHASE_HANDLERS = {
     "report": _replay_report,
     "expire": _replay_expire,
 }
-
-
-def journal_state_version(active_path: Path, rotated_path: Path | None) -> int:
-    """Highest state_version journaled across both retained segments (0 when none).
-
-    Raises ValueError on a corrupt non-final line, exactly like replay."""
-    highest = 0
-    for fpath in (rotated_path, active_path):
-        if fpath is None or not fpath.exists():
-            continue
-        for entry in _read_journal(fpath):
-            highest = max(highest, int(entry.get("state_version", 0)))
-    return highest
 
 
 def replay_log(

@@ -90,6 +90,16 @@ class QuotaLedger:
                     return
         raise LedgerEventNotFoundError(event_id, arm_id)
 
+    def _prune(self, arm: ArmConfig, arm_events: deque[LedgerEvent], now: float) -> None:
+        """Drops events no window nor a live pending can still reference (P3-MF-1). Runs for
+        every arm: per-token arms have no windows but record an event per select (P5-MF-4)."""
+        retention_s = self._retention_s(arm)
+        if retention_s <= 0:
+            return
+        cutoff = now - retention_s
+        while arm_events and arm_events[0].ts < cutoff:
+            self._event_ids.discard(arm_events.popleft().event_id)
+
     def _retention_s(self, arm: ArmConfig) -> float:
         """Events stay correctable for the whole pending TTL, even once outside every window."""
         return max(self._get_max_window_duration_s(arm), float(self.config.bandit.pending_ttl_s))
@@ -113,17 +123,10 @@ class QuotaLedger:
         util = np.zeros((k_max, w_max), dtype=np.float32)
 
         for i, arm in enumerate(self.config.arms):
+            arm_events = self.events.get(arm.arm_id, deque())
+            self._prune(arm, arm_events, now)
             if arm.billing_mode != "subscription" or not arm.windows:
                 continue
-
-            arm_events = self.events.get(arm.arm_id, deque())
-            retention_s = self._retention_s(arm)
-
-            # Prune events no window nor a live pending can still reference (P3-MF-1)
-            if retention_s > 0:
-                cutoff = now - retention_s
-                while arm_events and arm_events[0].ts < cutoff:
-                    self._event_ids.discard(arm_events.popleft().event_id)
 
             for j, w in enumerate(arm.windows):
                 if j >= w_max:

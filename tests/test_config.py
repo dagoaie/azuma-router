@@ -77,3 +77,16 @@ def test_to_static_config_padding() -> None:
 
     # StaticConfig must be hashable
     assert hash(static) is not None
+
+
+def test_load_config_reports_an_unreadable_file_as_a_config_error(tmp_path: Path) -> None:
+    """Permission problems are an operator error like a missing file, not a traceback (P5-MF-3)."""
+    unreadable = tmp_path / "azuma.toml"
+    unreadable.write_text('schema_version = "1"\n')
+    unreadable.chmod(0o000)
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(unreadable)
+
+    assert exc_info.value.field == "file"
+    assert "Permission denied" in exc_info.value.reason

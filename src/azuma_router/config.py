@@ -353,11 +353,14 @@ def load_config(path: str | Path) -> Config:
     if not path_obj.exists():
         raise ConfigError("file", f"Configuration file not found: {path_obj}")
 
-    with path_obj.open("rb") as f:
-        try:
-            data = tomllib.load(f)
-        except Exception as e:
-            raise ConfigError("toml", f"TOML parse error: {e}") from e
+    try:
+        raw = path_obj.read_bytes()
+    except OSError as e:
+        raise ConfigError("file", f"Configuration file not readable: {e}") from e
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise ConfigError("toml", f"TOML parse error: {e}") from e
 
     # schema_version
     if "schema_version" not in data:

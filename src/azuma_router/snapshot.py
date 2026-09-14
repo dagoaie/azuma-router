@@ -182,9 +182,14 @@ def restore_snapshot(
         msg = f"Failed to load safetensors file {tensor_path}: {err}"
         raise IncompatibleSnapshotError(msg) from err
 
-    state = state_from_numpy(tensors)
-
-    ledger = QuotaLedger.load(meta.ledger, config)
+    # A snapshot that passed the version/shape checks can still carry tensors or a ledger this
+    # build cannot decode; that is an operator problem, not a traceback (P5-MF-3).
+    try:
+        state = state_from_numpy(tensors)
+        ledger = QuotaLedger.load(meta.ledger, config)
+    except Exception as err:
+        msg = f"Failed to decode snapshot {dir_path}: {err!r}"
+        raise IncompatibleSnapshotError(msg) from err
     return state, ledger, meta
 
 

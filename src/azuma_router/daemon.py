@@ -26,6 +26,7 @@ from azuma_router.errors import (
     IncompatibleSnapshotError,
     InvalidContextError,
     InvalidRequestLineError,
+    JournalApplyError,
     JournalWriteError,
     LedgerEventNotFoundError,
     NumericalIntegrityError,
@@ -54,7 +55,7 @@ from azuma_router.types import (
     RoutingRequest,
     SnapshotMeta,
 )
-from azuma_router.wal import DecisionLog, PendingStore, journal_state_version, replay_log
+from azuma_router.wal import DecisionLog, PendingStore, replay_log
 
 
 def uuid7() -> str:
@@ -194,6 +195,7 @@ class Router:
         self.decision_log_path = Path(d_log)
 
         self.ready = False
+        self.closing = False
         self.state_version = 0
         self.updates_since_snapshot = 0
         self.last_snapshot_ts = self.clock()
@@ -298,13 +300,11 @@ class Router:
         self.last_ts = now
 
     def _refuse_learned_journal_without_snapshot(self, rotated_path: Path) -> None:
-        """A journaled update in any retained segment needs the snapshot it built on (P3-MF-2)."""
-        try:
-            learned_version = journal_state_version(self.decision_log_path, rotated_path)
-        except (ValueError, OSError) as err:
-            _exit_unrecoverable("replay_failed", err)
-        if learned_version > 0:
-            msg = f"WAL holds state_version {learned_version} but no snapshot/ directory exists"
+        """Rotation always follows a snapshot, so a rotated segment without snapshot/ means the
+        snapshot was lost (P3-MF-2). An unrotated journal replays whole from the initial state,
+        which is exactly the case of a kill before the first cadence snapshot (P5-MF-1)."""
+        if rotated_path.exists():
+            msg = "journal was rotated (which always follows a snapshot) but no snapshot/ exists"
             _exit_unrecoverable("wal_inconsistent", msg)
 
     def _journal_expire(self, decision_id: str, ts_select: float, now: float) -> None:
@@ -568,13 +568,20 @@ class Router:
         if self.dlog is not None:
             self.dlog.append(report_entry)
 
-        self.ledger.correct(pending.ledger_event_id, arm.arm_id, actual_units)
-        self.state_version = next_state_version
-        x_jax = to_jax_array(pending.x)
-        self.state = update_jit(self.state, x_jax, pending.arm_index, reward, self.static)
-
-        self.pending_store.pop(d_id)
-        self.pending_store.mark_applied(d_id)
+        # The line is durable: from here on, memory must reach the journaled state or the
+        # process must die so replay reconciles it on restart (P5-MF-1).
+        try:
+            self.ledger.correct(pending.ledger_event_id, arm.arm_id, actual_units)
+            self.state_version = next_state_version
+            x_jax = to_jax_array(pending.x)
+            self.state = update_jit(self.state, x_jax, pending.arm_index, reward, self.static)
+            self.pending_store.pop(d_id)
+            self.pending_store.mark_applied(d_id)
+        except Exception as err:
+            msg = (
+                f"report {d_id} journaled as state_version {next_state_version} not applied: {err}"
+            )
+            raise JournalApplyError(msg) from err
         self.updates_since_snapshot += 1
 
         self._maybe_snapshot()
@@ -682,7 +689,11 @@ class Router:
         }
 
     def close(self, *, with_snapshot: bool = True) -> int:
-        """Flushes and closes; the shutdown snapshot is skipped when state may be corrupt."""
+        """Flushes and closes; the shutdown snapshot is skipped when state may be corrupt.
+
+        `closing` is set first so a signal landing mid-close is ignored instead of starting a
+        second close with a snapshot the fatal path forbids (P5-MF-2)."""
+        self.closing = True
         exit_code = 0
         if self.ready and with_snapshot:
             try:
@@ -755,6 +766,7 @@ def _dispatch_rpc_method(router: Router, method: str, params: dict[str, Any]) ->
 # or cannot persist it (contract: numerical corruption is never snapshotted).
 _FATAL_POLICY: dict[type[AzumaError], tuple[str, bool]] = {
     JournalWriteError: ("journal_write_error", True),
+    JournalApplyError: ("journal_apply_error", False),
     SnapshotWriteError: ("snapshot_write_error", False),
     NumericalIntegrityError: ("numerical_integrity_error", False),
     LedgerEventNotFoundError: ("ledger_integrity_error", False),
@@ -859,11 +871,10 @@ class ShutdownCoordinator:
         self._stderr = stderr
         self._in_flight = False
         self._requested = False
-        self._closing = False
 
     def on_signal(self, sig: int, _frame: Any) -> None:
         _log_event(self._stderr, "info", "signal_received", signal=sig)
-        if self._closing:
+        if self._router.closing:
             return
         if self._in_flight:
             self._requested = True
@@ -879,11 +890,10 @@ class ShutdownCoordinator:
             yield
         finally:
             self._in_flight = False
-            if self._requested:
+            if self._requested and not self._router.closing:
                 self.close_and_exit()
 
     def close_and_exit(self) -> NoReturn:
-        self._closing = True
         sys.exit(self._router.close())
 
 

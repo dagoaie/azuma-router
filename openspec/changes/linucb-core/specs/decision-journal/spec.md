@@ -33,7 +33,15 @@ Decisiones con `now − ts_select > pending_ttl_s` SHALL expirar en el barrido e
 - **THEN** las respuestas son `-32002` y `-32003` respectivamente (AC-21)
 
 ### Requirement: Replay en arranque
-Al arrancar, el daemon SHALL reconstruir el `PendingStore` leyendo el fichero rotado anterior y el activo, en orden: **toda** línea `select` retenida sin `report`/`expire` posterior es un pendiente vivo, sea cual sea su `state_version` (los `select` no lo avanzan), y el ledger se reconstruye de forma idempotente por `ledger_event_id`. Solo las líneas `report` con `state_version > snapshot.state_version` SHALL reaplicarse (`update` con la `x` y `arm_index` de su `select`). Un `report` sin `select` retenido ⇒ journal corrupto ⇒ salida 3. Una última línea corrupta SHALL descartarse; una línea corrupta no final SHALL abortar el arranque con código 3 (FR-23). Sin `snapshot/`, un `state_version > 0` en **cualquiera** de los dos segmentos ⇒ inconsistencia ⇒ salida 3.
+Al arrancar, el daemon SHALL reconstruir el `PendingStore` leyendo el fichero rotado anterior y el activo, en orden: **toda** línea `select` retenida sin `report`/`expire` posterior es un pendiente vivo, sea cual sea su `state_version` (los `select` no lo avanzan), y el ledger se reconstruye de forma idempotente por `ledger_event_id`. Solo las líneas `report` con `state_version > snapshot.state_version` SHALL reaplicarse (`update` con la `x` y `arm_index` de su `select`). Un `report` sin `select` retenido ⇒ journal corrupto ⇒ salida 3. Una última línea corrupta SHALL descartarse; una línea corrupta no final SHALL abortar el arranque con código 3 (FR-23). Los `report` reaplicados SHALL ser contiguos en `state_version` a partir de `snapshot.state_version + 1`; un hueco ⇒ `replay_failed` ⇒ salida 3. Sin `snapshot/`, un `decisions.1.jsonl` presente ⇒ inconsistencia (`wal_inconsistent`, la rotación siempre sigue a un snapshot) ⇒ salida 3; un `decisions.jsonl` sin rotar SHALL reproducirse íntegro desde el estado inicial.
+
+#### Scenario: kill antes del primer snapshot
+- **WHEN** un daemon nuevo aplica un `report` y muere sin snapshot ni rotación
+- **THEN** al relanzar, `state_version == 1` y el brazo reportado tiene `n_pulls == 1`
+
+#### Scenario: hueco en los reports
+- **WHEN** el journal conserva el `report` con `state_version == 2` pero no el `1`
+- **THEN** stderr contiene `replay_failed` y el proceso sale con código 3
 
 #### Scenario: pendiente reconstruida
 - **WHEN** se hace replay de un JSONL con un `select` sin `report`

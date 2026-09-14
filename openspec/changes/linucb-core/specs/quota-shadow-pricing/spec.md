@@ -5,7 +5,11 @@ Ledger exacto de consumo por brazo con ventanas rodantes y de reset fijo, vista 
 ## ADDED Requirements
 
 ### Requirement: Ventanas y utilización
-`QuotaLedger.record(arm_index, units, ts)` y `QuotaLedger.utilization(now) -> f32[k_max, w_max]` SHALL devolver `u = consumido_en_ventana / capacity`, donde `RollingWindow(duration_s, capacity)` cuenta los últimos `duration_s` segundos y `FixedResetWindow(period, reset_anchor, capacity)` cuenta desde el último instante de reset alineado con `reset_anchor`. Slots sin ventana SHALL valer `0.0`. El reloj SHALL ser inyectable (FR-14).
+`QuotaLedger.record(arm_index, units, ts)` y `QuotaLedger.utilization(now) -> f32[k_max, w_max]` SHALL devolver `u = consumido_en_ventana / capacity`, donde `RollingWindow(duration_s, capacity)` cuenta los últimos `duration_s` segundos y `FixedResetWindow(period, reset_anchor, capacity)` cuenta desde el último instante de reset alineado con `reset_anchor`. Slots sin ventana SHALL valer `0.0`. El reloj SHALL ser inyectable (FR-14). En cada `utilization` el ledger SHALL podar, para **todo** brazo (también `per_token`, sin ventanas), los eventos más antiguos que `max(ventana más larga, pending_ttl_s)`: ningún pendiente vivo puede corregirlos ya, y sin poda cada `select` crecería en memoria y en el snapshot para siempre.
+
+#### Scenario: brazo per_token no acumula eventos
+- **WHEN** un brazo `per_token` recibe 5 ciclos `select` → `report` separados por `2 × pending_ttl_s`
+- **THEN** el ledger conserva solo el evento del último ciclo
 
 #### Scenario: ventana rodante olvida
 - **WHEN** se registran 10 units en `t = 0` con `RollingWindow(duration_s = 100, capacity = 20)` y se consulta en `t = 101`

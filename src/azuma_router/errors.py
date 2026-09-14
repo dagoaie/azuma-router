@@ -36,6 +36,11 @@ class JournalWriteError(AzumaError):
     """Fatal failure writing or flushing to the decision journal (WAL)."""
 
 
+class JournalApplyError(AzumaError):
+    """A durably journaled ``report`` could not be applied in memory; only a restart (replay)
+    can reconcile state, so no snapshot may be taken from this process."""
+
+
 class SnapshotWriteError(AzumaError):
     """Fatal failure publishing a snapshot; the last good snapshot stays in place (ADR-0009)."""
 
