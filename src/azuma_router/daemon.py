@@ -168,8 +168,12 @@ def _build_select_diagnostics(
     }
 
 
-def _exit_unrecoverable(event: str, reason: object) -> NoReturn:
-    """Boot cannot continue without operator action: structured stderr event, exit 3 (ADR-0014)."""
+def _exit_unrecoverable(router: "Router", event: str, reason: object) -> NoReturn:
+    """Boot cannot continue without operator action: structured stderr event, exit 3 (ADR-0014).
+
+    `closing` is latched first so a signal landing before `sys.exit` cannot turn the exit
+    code into 0 through the coordinator (P6-RR-2)."""
+    router.closing = True
     _log_event(sys.stderr, "error", event, error=str(reason))
     sys.exit(3)
 
@@ -215,9 +219,9 @@ class Router:
         try:
             res_snap = restore_snapshot(self.snapshot_dir, self.config)
         except IncompatibleSnapshotError as err:
-            _exit_unrecoverable("incompatible_snapshot", err)
+            _exit_unrecoverable(self, "incompatible_snapshot", err)
         except OSError as err:
-            _exit_unrecoverable("snapshot_read_failed", err)
+            _exit_unrecoverable(self, "snapshot_read_failed", err)
         restored_state, restored_ledger, restored_meta = res_snap
 
         if restored_state is not None and restored_ledger is not None and restored_meta is not None:
@@ -242,7 +246,7 @@ class Router:
                 ledger=self.ledger,
             )
         except (ValueError, OSError) as err:
-            _exit_unrecoverable("replay_failed", err)
+            _exit_unrecoverable(self, "replay_failed", err)
 
         self.pending_store = p_store
 
@@ -305,7 +309,7 @@ class Router:
         which is exactly the case of a kill before the first cadence snapshot (P5-MF-1)."""
         if rotated_path.exists():
             msg = "journal was rotated (which always follows a snapshot) but no snapshot/ exists"
-            _exit_unrecoverable("wal_inconsistent", msg)
+            _exit_unrecoverable(self, "wal_inconsistent", msg)
 
     def _journal_expire(self, decision_id: str, ts_select: float, now: float) -> None:
         """Appends the single expire WAL line shape shared by every expiry path (P3-SF-1)."""
@@ -777,6 +781,7 @@ _FATAL_ERRORS = tuple(_FATAL_POLICY)
 def _exit_fatal(stderr: TextIO, router: Router, err: AzumaError, phase: str) -> NoReturn:
     """Logs a fatal integrity error, closes the router and exits 4 (ADR-0014)."""
     event_name, with_snapshot = _FATAL_POLICY[type(err)]
+    router.closing = True  # a signal from here on must not replace exit 4 (P6-RR-2)
     _log_event(stderr, "error", event_name, phase=phase, error=str(err))
     router.close(with_snapshot=with_snapshot)
     sys.exit(4)

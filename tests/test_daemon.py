@@ -1,5 +1,6 @@
 """Unit and integration tests for Router daemon orchestration and protocol lifecycle."""
 
+import importlib
 import io
 import json
 import math
@@ -25,6 +26,9 @@ from azuma_router.errors import (
 from azuma_router.quota import QuotaLedger
 from azuma_router.wal import PendingStore
 from conftest import load_fixture_config_with
+
+# `azuma_router.snapshot` the attribute is the re-exported function, not the module.
+snapshot_mod = importlib.import_module("azuma_router.snapshot")
 
 CODEX = "gpt-5-codex@openai-codex"
 REQUEST = {
@@ -1464,3 +1468,86 @@ def test_per_token_ledger_events_are_pruned_once_no_pending_can_correct_them(
 
     assert len(router.ledger.dump()["events"][per_token_arm]) == 1
     router.close()
+
+
+def test_serve_exits_4_when_the_snapshot_backend_fails_with_a_non_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A safetensors failure is as fatal as a disk failure: exit 4 with the previous snapshot
+    intact, never a -32603 that leaves the daemon serving without snapshots (P6-RR-1)."""
+    router = _booted_router(tmp_path)
+    router.snapshot({})
+    previous_meta = _snapshot_meta_path_of(tmp_path).read_text()
+
+    def backend_failure(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("simulated safetensors backend failure")
+
+    monkeypatch.setattr(snapshot_mod, "save_file", backend_failure)
+
+    code, events = _serve_one_request(router, "snapshot", {})
+
+    assert code == 4
+    assert [e["event"] for e in events if e["level"] == "error"] == ["snapshot_write_error"]
+    assert _snapshot_meta_path_of(tmp_path).read_text() == previous_meta
+
+
+def _snapshot_meta_path_of(tmp_path: Path) -> Path:
+    return tmp_path / ".azuma" / "snapshot" / "state.json"
+
+
+def _main_exit_with_sigterm_after(
+    monkeypatch: pytest.MonkeyPatch, fatal_event: str
+) -> tuple[int, list[str]]:
+    """Runs main() and delivers a real SIGTERM right after `fatal_event` is logged: the
+    narrowest window in which a signal could replace a fatal exit code with 0 (P6-RR-2)."""
+    real_log_event = daemon_mod._log_event
+
+    def log_event_then_signal(stream: Any, level: str, event: str, **fields: Any) -> None:
+        real_log_event(stream, level, event, **fields)
+        if event == fatal_event:
+            signal.raise_signal(signal.SIGTERM)
+
+    monkeypatch.setattr(daemon_mod, "_log_event", log_event_then_signal)
+    monkeypatch.setattr(sys, "argv", ["azuma-router", "--config", "azuma.toml"])
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    previous_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            main()
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+    events = [json.loads(line)["event"] for line in stderr.getvalue().splitlines()]
+    return int(exit_info.value.code or 0), events
+
+
+def test_a_signal_right_after_an_unrecoverable_boot_failure_keeps_exit_3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    load_fixture_config_with(tmp_path)  # writes tmp_path/azuma.toml with relative paths
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".azuma").mkdir()
+    (tmp_path / ".azuma" / "decisions.1.jsonl").write_text("")  # rotated segment, no snapshot
+
+    code, events = _main_exit_with_sigterm_after(monkeypatch, "wal_inconsistent")
+
+    assert code == 3
+    assert events == ["wal_inconsistent", "signal_received"]
+
+
+def test_a_signal_right_after_a_fatal_boot_failure_keeps_exit_4(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    load_fixture_config_with(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def failing_boot(self: Router) -> dict[str, object]:
+        raise NumericalIntegrityError("simulated corrupt state")
+
+    monkeypatch.setattr(Router, "boot", failing_boot)
+
+    code, events = _main_exit_with_sigterm_after(monkeypatch, "numerical_integrity_error")
+
+    assert code == 4
+    assert events == ["numerical_integrity_error", "signal_received"]

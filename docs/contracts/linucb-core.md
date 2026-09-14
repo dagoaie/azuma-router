@@ -62,7 +62,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 - **FR-24** `report` de `decision_id` desconocido ⇒ `-32002`; expirado ⇒ `-32003`.
 
 ### 3.7 Snapshot (ADR-0009, 0017)
-- **FR-25** `snapshot(state, ledger, meta, dir)` DEBE escribir `state.safetensors` + `state.json` en `<dir>/snapshot.tmp/`, `fsync` ambos, `fsync` del directorio, `rename` a `<dir>/snapshot/` (reemplazando el anterior de forma atómica) y `fsync` del directorio padre antes de borrar `snapshot.old/`. Un `OSError` en cualquier paso ⇒ `snapshot_write_error`, salida código 4. `config_sha256` = SHA-256 del JSON canónico del `Config` validado completo.
+- **FR-25** `snapshot(state, ledger, meta, dir)` DEBE escribir `state.safetensors` + `state.json` en `<dir>/snapshot.tmp/`, `fsync` ambos, `fsync` del directorio, `rename` a `<dir>/snapshot/` (reemplazando el anterior de forma atómica) y `fsync` del directorio padre antes de borrar `snapshot.old/`. Cualquier excepción en cualquier paso (`OSError`, safetensors, serialización) ⇒ `snapshot_write_error`, salida código 4; nunca un `-32603` que deje al daemon sirviendo sin snapshots. `config_sha256` = SHA-256 del JSON canónico del `Config` validado completo.
 - **FR-26** `restore(dir, config) -> (state, ledger, meta)` DEBE lanzar `IncompatibleSnapshotError` si difiere cualquiera de: `schema_version`, `d`, `K_max`, `W_max`, `featurizer_version`, `arm_ids`. Nunca migrar.
 - **FR-27** `restore(snapshot(s)) == s` bitwise para todos los arrays.
 - **FR-28** El daemon DEBE hacer snapshot cuando `updates_since_snapshot ≥ 100` **o** `now − last_snapshot ≥ 30 s` (evaluado tras cada `report`) y en shutdown limpio (EOF en stdin o SIGTERM/SIGINT). Una señal recibida mientras una petición está en curso se **difiere** hasta que esa petición ha respondido (`shutdown_deferred`); nunca se hace snapshot a mitad de un `report`.
@@ -338,6 +338,7 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 | SIGTERM durante escritura de snapshot | El rename es atómico: o queda el anterior o el nuevo, nunca mixto. |
 | SIGTERM/SIGINT con una petición en curso | Se registra `signal_received` + `shutdown_deferred`; la petición responde y después se cierra (snapshot + exit). Toda señal que llegue con un cierre ya iniciado (ordenado o fatal) se ignora: nunca hay un segundo `close` ni un snapshot que el cierre fatal prohíbe. |
 | Fallo de E/S persistente (WAL abrir/escribir/rotar, snapshot) | `journal_write_error` ⇒ salida 4 **con** snapshot de cierre; `snapshot_write_error` ⇒ salida 4 sin reintentar el snapshot. Nunca se responde OK a una petición cuya línea no llegó al journal. |
+| Señal entre el log de un fallo fatal/irrecuperable y su salida | `closing` se fija antes del log: la señal se registra y se ignora; el código de salida 3/4 se conserva (nunca un 0 que lo enmascare). |
 | Respuesta con `NaN`/`Infinity` (serialización) | Imposible por construcción (`allow_nan=False`); si ocurre ⇒ `numerical_integrity_error`, salida 4 sin snapshot. |
 | Reloj retrocede (NTP) | El ledger usa `time.time()`; un salto atrás puede rejuvenecer eventos; se acepta (ventanas se recuperan solas). Se registra `warning` si `now < last_ts − 1 s`. |
 | `select` en brazo cuyo `barrier_mu = 0` pero con ventana | `shadow = 0` pero `u ≥ 1` sigue enmascarando (FR-15). |

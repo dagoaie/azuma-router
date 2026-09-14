@@ -15,7 +15,7 @@ from pathlib import Path
 from safetensors.numpy import load_file, save_file
 
 from azuma_router.config import Config
-from azuma_router.errors import IncompatibleSnapshotError, SnapshotWriteError
+from azuma_router.errors import AzumaError, IncompatibleSnapshotError, SnapshotWriteError
 from azuma_router.quota import QuotaLedger
 from azuma_router.state import state_from_numpy, state_to_numpy
 from azuma_router.types import BanditState, SnapshotMeta
@@ -45,7 +45,11 @@ def write_snapshot(
     """
     try:
         return _write_snapshot_files(Path(dir_path), state, ledger, meta)
-    except OSError as err:
+    except AzumaError:
+        raise
+    except Exception as err:
+        # Any backend failure (OSError, safetensors, serialization) is one fail-stop policy:
+        # the daemon must not keep serving without snapshots (P6-RR-1).
         raise SnapshotWriteError(f"snapshot write failed: {err}") from err
 
 

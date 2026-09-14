@@ -34,8 +34,12 @@ Persistencia atómica del estado del bandido y del ledger en safetensors + JSON,
 - **THEN** `A`, `b`, `n_pulls`, `mask`, `rng_key` son bitwise iguales y `utilization(now)` coincide (AC-24)
 
 ### Requirement: Residuos al arrancar
-Al arrancar, un `snapshot.tmp/` residual SHALL borrarse. Si no existe `snapshot/` pero el journal contiene `state_version > 0`, el daemon SHALL abortar con código 3 por inconsistencia.
+Al arrancar, un `snapshot.tmp/` residual SHALL borrarse. Si no existe `snapshot/` pero sí `decisions.1.jsonl`, el daemon SHALL abortar con código 3 (`wal_inconsistent`): la rotación siempre sigue a un snapshot, así que el snapshot se ha perdido. Un `decisions.jsonl` sin rotar y sin `snapshot/` SHALL reproducirse íntegro desde el estado inicial.
 
-#### Scenario: journal sin snapshot
-- **WHEN** no hay `snapshot/` y `decisions.jsonl` contiene una línea `report` con `state_version = 5`
-- **THEN** el arranque falla con código de salida 3 y un error en stderr
+#### Scenario: segmento rotado sin snapshot
+- **WHEN** no hay `snapshot/` y existe `decisions.1.jsonl`
+- **THEN** el arranque falla con código de salida 3 y `wal_inconsistent` en stderr
+
+#### Scenario: journal sin rotar sin snapshot
+- **WHEN** no hay `snapshot/` y `decisions.jsonl` contiene un `report` con `state_version = 1`
+- **THEN** el daemon arranca con `state_version == 1`
