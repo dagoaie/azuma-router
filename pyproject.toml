@@ -1,0 +1,49 @@
+[project]
+name = "azuma-router"
+version = "0.1.0"
+description = "High-performance Contextual Bandit LLM Router compiled in JAX with quota-aware shadow pricing."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "jax>=0.11.1",
+    "safetensors>=0.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "hypothesis>=6",
+    "pytest-benchmark>=5",
+    "ruff>=0.12",
+    "mypy>=1.17",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/azuma_router"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not bench' -q"
+markers = ["bench: latency benchmarks (excluded by default)"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "N", "ANN", "RUF"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["azuma_router"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src"]
