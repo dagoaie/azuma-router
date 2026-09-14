@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from azuma_router.config import load_config
 from azuma_router.quota import QuotaLedger
@@ -86,3 +87,12 @@ def test_dump_and_load_roundtrip() -> None:
     u_orig = ledger.utilization(now=2500.0)
     u_rest = restored_ledger.utilization(now=2500.0)
     np.testing.assert_array_equal(u_orig, u_rest)
+
+
+def test_ledger_event_not_found_error() -> None:
+    from azuma_router.errors import LedgerEventNotFoundError
+
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    ledger = QuotaLedger(cfg)
+    with pytest.raises(LedgerEventNotFoundError):
+        ledger.correct(99999, "gpt-5-codex@openai-codex", 1.0)

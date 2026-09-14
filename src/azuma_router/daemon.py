@@ -23,6 +23,7 @@ from azuma_router.errors import (
     ConfigError,
     InvalidContextError,
     JournalWriteError,
+    NumericalIntegrityError,
     RpcError,
 )
 from azuma_router.featurizer import FEATURIZER_VERSION, featurize
@@ -41,6 +42,7 @@ from azuma_router.state import (
     to_jax_array,
 )
 from azuma_router.types import (
+    MAX_INT31,
     BanditState,
     Pending,
     RoutingRequest,
@@ -96,10 +98,11 @@ def _check_finite_float(
 
 
 def _check_non_neg_int(val: Any, field_name: str) -> int:
+    msg = f"{field_name} must be int between 0 and 2**31-1"
     if val is None or isinstance(val, bool) or not isinstance(val, int):
-        raise RpcError(-32602, f"{field_name} must be int >= 0", data={"field": field_name})
-    if val < 0:
-        raise RpcError(-32602, f"{field_name} must be int >= 0", data={"field": field_name})
+        raise RpcError(-32602, msg, data={"field": field_name})
+    if not (0 <= val <= MAX_INT31):
+        raise RpcError(-32602, msg, data={"field": field_name})
     return val
 
 
@@ -133,12 +136,26 @@ def _build_select_diagnostics(
     util_matrix: np.ndarray,
     est_units_arr: np.ndarray,
 ) -> dict[str, Any]:
+    policies = [float(diag.policy[i]) for i in range(len(arms))]
+
+    def _val_or_none(val: Any, active: bool) -> float | None:
+        return float(val) if active else None
+
     return {
-        "score": {arm.arm_id: float(diag.score[i]) for i, arm in enumerate(arms)},
-        "exploit": {arm.arm_id: float(diag.exploit[i]) for i, arm in enumerate(arms)},
-        "bonus": {arm.arm_id: float(diag.bonus[i]) for i, arm in enumerate(arms)},
-        "shadow_price": {arm.arm_id: float(diag.shadow_price[i]) for i, arm in enumerate(arms)},
-        "policy": {arm.arm_id: float(diag.policy[i]) for i, arm in enumerate(arms)},
+        "score": {
+            arm.arm_id: _val_or_none(diag.score[i], policies[i] > 0) for i, arm in enumerate(arms)
+        },
+        "exploit": {
+            arm.arm_id: _val_or_none(diag.exploit[i], policies[i] > 0) for i, arm in enumerate(arms)
+        },
+        "bonus": {
+            arm.arm_id: _val_or_none(diag.bonus[i], policies[i] > 0) for i, arm in enumerate(arms)
+        },
+        "shadow_price": {
+            arm.arm_id: _val_or_none(diag.shadow_price[i], policies[i] > 0)
+            for i, arm in enumerate(arms)
+        },
+        "policy": {arm.arm_id: policies[i] for i, arm in enumerate(arms)},
         "utilization": {
             arm.arm_id: {
                 f"{w.kind}:{w.duration_s or w.period}": float(util_matrix[i, j])
@@ -366,7 +383,7 @@ class Router:
             _log_event(
                 sys.stderr, "error", "non_finite_score", error="Non-finite score detected in select"
             )
-            sys.exit(4)
+            raise NumericalIntegrityError("Non-finite score detected in select")
 
         if bool(diag.no_arm_available):
             masked_reason: dict[str, str] = {}
@@ -385,7 +402,9 @@ class Router:
         d_id = uuid7()
         est_u = float(est_units_arr[arm_i])
 
-        # Write WAL line select BEFORE mutating state/ledger (FR-20 / MF-2)
+        eid = self.ledger.peek_next_event_id()
+
+        # Write WAL line select BEFORE mutating state or ledger (FR-20 / MF-2)
         util_dict = {
             arm.arm_id: util_matrix[idx, : len(arm.windows)].tolist()
             for idx, arm in enumerate(self.config.arms)
@@ -408,13 +427,15 @@ class Router:
             "shadow_price": np.array(diag.shadow_price).tolist(),
             "utilization": util_dict,
             "est_units": est_u,
+            "ledger_event_id": eid,
             "featurizer_version": FEATURIZER_VERSION,
         }
         if self.dlog is not None:
             self.dlog.append(select_entry)
 
         # Mutate ledger and state only AFTER WAL append succeeds
-        eid = self.ledger.record(chosen_arm.arm_id, est_u, now)
+        rec_eid = self.ledger.record(chosen_arm.arm_id, est_u, now)
+        assert rec_eid == eid
         self.state = state_next
 
         pending = Pending(
@@ -426,8 +447,10 @@ class Router:
             est_units=est_u,
             ledger_event_id=eid,
             state_version=self.state_version,
+            raw_entry=select_entry,
         )
         self.pending_store.put(pending)
+        self._maybe_snapshot()
 
         res = {
             "decision_id": d_id,
@@ -560,11 +583,28 @@ class Router:
 
     def _maybe_snapshot(self) -> None:
         now = self.clock()
-        if (
+        should_snapshot = (
             self.updates_since_snapshot >= self.config.bandit.snapshot_every_updates
             or (now - self.last_snapshot_ts) >= self.config.bandit.snapshot_every_s
-        ):
+        )
+        needs_rot = self.dlog is not None and self.dlog.needs_rotation
+
+        if should_snapshot or needs_rot:
             self.snapshot({})
+
+        if needs_rot and self.dlog is not None:
+            carry_forward = [
+                p.raw_entry for p in self.pending_store.values() if p.raw_entry is not None
+            ]
+            bytes_before = self.dlog.path.stat().st_size if self.dlog.path.exists() else 0
+            self.dlog.rotate(carry_forward=carry_forward)
+            _log_event(
+                sys.stderr,
+                "info",
+                "wal_rotated",
+                bytes=bytes_before,
+                carried_forward=len(carry_forward),
+            )
 
     def snapshot(self, params: dict[str, Any]) -> dict[str, Any]:
         """Barries expired and writes state snapshot (FR-25, FR-28)."""
@@ -787,11 +827,16 @@ def serve(
 
             if req_id is not None:
                 resp = {"jsonrpc": "2.0", "id": req_id, "result": result}
-                stdout.write(json.dumps(resp) + "\n")
+                try:
+                    out = json.dumps(resp, allow_nan=False) + "\n"
+                except ValueError as err:
+                    msg = f"Non-finite float in response serialization: {err}"
+                    raise NumericalIntegrityError(msg) from err
+                stdout.write(out)
                 stdout.flush()
 
-        except JournalWriteError as err:
-            _log_event(stderr, "error", "journal_write_error", error=str(err))
+        except (JournalWriteError, NumericalIntegrityError) as err:
+            _log_event(stderr, "error", type(err).__name__.lower(), error=str(err))
             code = router.close()
             sys.exit(code or 4)
         except RpcError as err:

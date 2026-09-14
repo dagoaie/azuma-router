@@ -5,6 +5,7 @@ Complies with contract §3.6, §4.4, FR-20..FR-24, ADR-0011, ADR-0016.
 
 import json
 from collections import OrderedDict
+from collections.abc import Sequence
 from io import TextIOWrapper
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -20,7 +21,7 @@ from azuma_router.types import Pending
 
 
 class DecisionLog:
-    """Append-only JSONL log writer with max-byte rotation (ADR-0011)."""
+    """Append-only JSONL log writer with max-byte rotation owned by Router (ADR-0011 / MF-2)."""
 
     def __init__(self, path: str | Path, max_bytes: int = 268435456) -> None:
         self.path = Path(path)
@@ -34,30 +35,35 @@ class DecisionLog:
             line = json.dumps(entry, separators=(",", ":"), allow_nan=False) + "\n"
             self.file.write(line)
             self.file.flush()
-
-            phase = entry.get("phase")
-            if phase in ("report", "expire"):
-                self._maybe_rotate()
         except JournalWriteError:
             raise
         except Exception as err:
             raise JournalWriteError(f"WAL append failed: {err}") from err
 
-    def _maybe_rotate(self) -> None:
-        """Rotates file to decisions.1.jsonl if size exceeds max_bytes."""
+    @property
+    def needs_rotation(self) -> bool:
+        """True if current WAL size exceeds max_bytes (MF-2)."""
         if not self.path.exists():
-            return
-        if self.path.stat().st_size > self.max_bytes:
-            self.file.flush()
-            self.file.close()
+            return False
+        self.file.flush()
+        return self.path.stat().st_size > self.max_bytes
 
-            # Rotate path: decisions.jsonl -> decisions.1.jsonl
-            rotated_path = self.path.with_name(f"{self.path.stem}.1{self.path.suffix}")
-            if rotated_path.exists():
-                rotated_path.unlink()
+    def rotate(self, carry_forward: Sequence[dict[str, Any]] = ()) -> None:
+        """Rotates file to decisions.1.jsonl and writes carried-forward entries (MF-2)."""
+        self.file.flush()
+        self.file.close()
+
+        rotated_path = self.path.with_name(f"{self.path.stem}.1{self.path.suffix}")
+        if rotated_path.exists():
+            rotated_path.unlink()
+        if self.path.exists():
             self.path.replace(rotated_path)
 
-            self.file = self.path.open("a", encoding="utf-8")
+        self.file = self.path.open("a", encoding="utf-8")
+        for entry in carry_forward:
+            line = json.dumps(entry, separators=(",", ":"), allow_nan=False) + "\n"
+            self.file.write(line)
+        self.file.flush()
 
     def close(self) -> None:
         if not self.file.closed:
@@ -101,6 +107,9 @@ class PendingStore:
         self._expired_ids[decision_id] = expired_at
         if len(self._expired_ids) > self._max_lru:
             self._expired_ids.popitem(last=False)
+
+    def values(self) -> list[Pending]:
+        return list(self._pending.values())
 
     def sweep(self, now: float, ttl_s: float) -> list[Pending]:
         """Sweeps expired pending decisions in insertion order until first non-expired (FR-22)."""
@@ -171,14 +180,17 @@ def replay_log(
             s_ver = entry.get("state_version", 0)
 
             if phase == "select":
+                if "ledger_event_id" not in entry:
+                    raise ValueError(f"Missing ledger_event_id in select line for decision {d_id}")
+                eid = int(entry["ledger_event_id"])
                 select_by_id[d_id] = entry
                 if s_ver >= snapshot_state_version:
-                    eid = 0
-                    if ledger is not None:
-                        eid = ledger.record(
+                    if ledger is not None and not ledger.has_event(eid):
+                        ledger.record(
                             entry["arm_id"],
                             float(entry.get("est_units", 0.0)),
                             float(entry["ts"]),
+                            event_id=eid,
                         )
                     pending_event_ids[d_id] = eid
                     pending = Pending(
@@ -190,6 +202,7 @@ def replay_log(
                         est_units=entry.get("est_units", 0.0),
                         ledger_event_id=eid,
                         state_version=s_ver,
+                        raw_entry=entry,
                     )
                     pending_store.put(pending)
 
@@ -198,10 +211,12 @@ def replay_log(
                 applied_ids.add(d_id)
                 pending_store.mark_applied(d_id)
                 eid = pending_event_ids.pop(d_id, 0)
+                if eid == 0 and d_id in select_by_id:
+                    eid = int(select_by_id[d_id].get("ledger_event_id", 0))
                 if ledger is not None and eid > 0:
                     arm_id = select_by_id[d_id]["arm_id"] if d_id in select_by_id else ""
                     actual_u = float(entry.get("actual_units", 0.0))
-                    if arm_id:
+                    if arm_id and ledger.has_event(eid):
                         ledger.correct(eid, arm_id, actual_u)
                 if s_ver > snapshot_state_version:
                     if d_id in select_by_id:

@@ -38,6 +38,8 @@ def test_load_valid_config() -> None:
         ("too_many_windows.toml", "arms[0].windows"),
         ("bad_period.toml", "arms[0].windows[0].period"),
         ("bad_anchor.toml", "arms[0].windows[0].reset_anchor"),
+        ("bool_as_number.toml", "bandit.seed"),
+        ("nan_price.toml", "arms[0].price_in_per_1m"),
     ],
 )
 def test_invalid_configs(filename: str, expected_field: str) -> None:

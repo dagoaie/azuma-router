@@ -68,3 +68,44 @@ def test_replay_corrupt_middle() -> None:
             config=cfg,
         )
     assert "WAL corrupt" in str(exc_info.value)
+
+
+def test_replay_select_missing_ledger_event_id_raises(tmp_path: Path) -> None:
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    wal_path = tmp_path / "missing_eid.jsonl"
+    line = {
+        "phase": "select",
+        "decision_id": "018f6c2e-0000-7000-8000-000000000001",
+        "ts": 1757800000.0,
+        "state_version": 0,
+        "arm_index": 0,
+        "arm_id": "gpt-5-codex@openai-codex",
+        "propensity": 0.8123,
+        "x": [1.0] * 32,
+        "policy": [0.8123] + [0.0] * 31,
+        "score": [0.71] + [-1e9] * 31,
+        "exploit": [0.5] + [0.0] * 31,
+        "bonus": [0.21] + [0.0] * 31,
+        "shadow_price": [0.0] * 32,
+        "utilization": {"gpt-5-codex@openai-codex": [0.0, 0.0]},
+        "est_units": 1.0,
+        "featurizer_version": 1,
+    }
+    # Notice no ledger_event_id in line!
+    wal_path.write_text(import_json_dumps(line) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc_info:
+        replay_log(
+            active_path=wal_path,
+            rotated_path=None,
+            snapshot_state_version=0,
+            config=cfg,
+        )
+    msg = str(exc_info.value)
+    assert "Missing ledger_event_id" in msg or "ledger_event_id" in msg
+
+
+def import_json_dumps(obj: object) -> str:
+    import json
+
+    return json.dumps(obj)

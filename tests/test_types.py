@@ -3,6 +3,8 @@
 import jax
 import jax.numpy as jnp
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from azuma_router.errors import InvalidContextError
 from azuma_router.types import (
@@ -251,3 +253,37 @@ def test_snapshot_meta_roundtrip() -> None:
     d = meta.to_dict()
     restored = SnapshotMeta.from_dict(d)
     assert restored == meta
+
+
+@given(
+    input_tokens=st.integers(),
+    expected_output_tokens=st.one_of(st.none(), st.integers()),
+    agent_depth=st.integers(),
+    diff_lines=st.one_of(st.none(), st.integers()),
+)
+def test_routing_request_integer_bounds_property(
+    input_tokens: int,
+    expected_output_tokens: int | None,
+    agent_depth: int,
+    diff_lines: int | None,
+) -> None:
+    try:
+        req = RoutingRequest(
+            task_kind=TaskKind.CODE_EDIT,
+            input_tokens=input_tokens,
+            expected_output_tokens=expected_output_tokens,
+            has_code=True,
+            has_tools=False,
+            has_images=False,
+            agent_depth=agent_depth,
+            diff_lines=diff_lines,
+            priority=Priority.NORMAL,
+        )
+        assert 0 <= req.input_tokens <= 2**31 - 1
+        assert 0 <= req.agent_depth <= 2**31 - 1
+        if req.expected_output_tokens is not None:
+            assert 0 <= req.expected_output_tokens <= 2**31 - 1
+        if req.diff_lines is not None:
+            assert 0 <= req.diff_lines <= 2**31 - 1
+    except Exception as exc:
+        assert type(exc).__name__ in ("InvalidContextError", "RpcError")

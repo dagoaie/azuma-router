@@ -213,8 +213,8 @@ report sobre inexistente → error -32002
  "x":[1.0,0.54,...],                       // 32 floats
  "policy":[0.01,0.8123,...],               // 32 floats (0 en enmascarados)
  "score":[...],"exploit":[...],"bonus":[...],"shadow_price":[...],
- "utilization":{"gpt-5-codex@openai-codex":[0.42,0.10]},
- "est_units":2.1,"featurizer_version":1}
+  "utilization":{"gpt-5-codex@openai-codex":[0.42,0.10]},
+ "est_units":2.1,"ledger_event_id":42,"featurizer_version":1}
 
 // phase = "report"
 {"phase":"report","decision_id":"018f...","ts":1757800012.9,"state_version":42,
@@ -253,7 +253,7 @@ Framing: UTF-8, un objeto JSON por línea terminada en `\n`, sin `Content-Length
   "decision_id":"018f6c2e-...",
   "arm":{"arm_id":"gpt-5-codex@openai-codex","model_id":"gpt-5-codex","provider":"openai-codex","billing_mode":"subscription"},
   "propensity":0.8123,
-  "diagnostics":{                                 // ausente si verbose=false
+  "diagnostics":{                                 // ausente si verbose=false; score, exploit, bonus, shadow_price de brazos enmascarados son null
     "score":{"gpt-5-codex@openai-codex":0.71,"qwen3-coder@openrouter":0.44},
     "exploit":{...},"bonus":{...},"shadow_price":{...},"policy":{...},
     "utilization":{"gpt-5-codex@openai-codex":{"rolling:18000":0.42,"fixed_reset:weekly":0.10}},

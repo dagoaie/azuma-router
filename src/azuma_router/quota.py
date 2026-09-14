@@ -60,13 +60,29 @@ class QuotaLedger:
         self._next_event_id: int = 1
         self.events: dict[str, deque[LedgerEvent]] = {arm.arm_id: deque() for arm in config.arms}
 
-    def record(self, arm_id: str, units: float, ts: float) -> int:
+    def peek_next_event_id(self) -> int:
+        """Returns the next event_id that will be assigned by record."""
+        return self._next_event_id
+
+    def has_event(self, event_id: int) -> bool:
+        """Returns True if event_id is present in active ledger events."""
+        for ev_queue in self.events.values():
+            for ev in ev_queue:
+                if ev.event_id == event_id:
+                    return True
+        return False
+
+    def record(self, arm_id: str, units: float, ts: float, event_id: int | None = None) -> int:
         """Records an estimated or final consumption event."""
         if arm_id not in self.events:
             self.events[arm_id] = deque()
 
-        eid = self._next_event_id
-        self._next_event_id += 1
+        if event_id is None:
+            eid = self._next_event_id
+            self._next_event_id += 1
+        else:
+            eid = event_id
+            self._next_event_id = max(self._next_event_id, eid + 1)
 
         ev = LedgerEvent(event_id=eid, arm_id=arm_id, units=units, ts=ts)
         self.events[arm_id].append(ev)

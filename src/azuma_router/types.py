@@ -17,6 +17,8 @@ F32 = jnp.float32
 I32 = jnp.int32
 U32 = jnp.uint32
 
+MAX_INT31 = 2**31 - 1
+
 
 class TaskKind(StrEnum):
     """Closed enum of 12 task kinds in exact ADR-0015 order."""
@@ -93,33 +95,36 @@ class RoutingRequest:
         if (
             not isinstance(self.input_tokens, int)
             or isinstance(self.input_tokens, bool)
-            or self.input_tokens < 0
+            or not (0 <= self.input_tokens <= MAX_INT31)
         ):
-            msg = f"input_tokens must be int >= 0, got {self.input_tokens!r}"
+            msg = f"input_tokens must be int between 0 and 2**31-1, got {self.input_tokens!r}"
             raise InvalidContextError("input_tokens", msg)
 
         if self.expected_output_tokens is not None and (
             not isinstance(self.expected_output_tokens, int)
             or isinstance(self.expected_output_tokens, bool)
-            or self.expected_output_tokens < 0
+            or not (0 <= self.expected_output_tokens <= MAX_INT31)
         ):
-            msg = f"expected_output_tokens must be int >= 0, got {self.expected_output_tokens!r}"
+            msg = (
+                "expected_output_tokens must be int between 0 and 2**31-1, "
+                f"got {self.expected_output_tokens!r}"
+            )
             raise InvalidContextError("expected_output_tokens", msg)
 
         if (
             not isinstance(self.agent_depth, int)
             or isinstance(self.agent_depth, bool)
-            or self.agent_depth < 0
+            or not (0 <= self.agent_depth <= MAX_INT31)
         ):
-            msg = f"agent_depth must be int >= 0, got {self.agent_depth!r}"
+            msg = f"agent_depth must be int between 0 and 2**31-1, got {self.agent_depth!r}"
             raise InvalidContextError("agent_depth", msg)
 
         if self.diff_lines is not None and (
             not isinstance(self.diff_lines, int)
             or isinstance(self.diff_lines, bool)
-            or self.diff_lines < 0
+            or not (0 <= self.diff_lines <= MAX_INT31)
         ):
-            msg = f"diff_lines must be int >= 0, got {self.diff_lines!r}"
+            msg = f"diff_lines must be int between 0 and 2**31-1, got {self.diff_lines!r}"
             raise InvalidContextError("diff_lines", msg)
 
 
@@ -204,6 +209,7 @@ class Pending:
     est_units: float
     ledger_event_id: int
     state_version: int
+    raw_entry: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)

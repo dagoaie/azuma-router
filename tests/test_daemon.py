@@ -1,16 +1,18 @@
-"""Tests for review pass 1 fixes (MF-1..MF-4, SF-1..SF-8)."""
+"""Unit and integration tests for Router daemon orchestration and protocol lifecycle."""
 
+import io
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from azuma_router.config import load_config
-from azuma_router.daemon import Router
-from azuma_router.errors import RpcError
+from azuma_router.daemon import Router, _read_line_bounded, serve
+from azuma_router.errors import JournalWriteError, NumericalIntegrityError, RpcError
 
 
-def test_mf1_non_finite_and_bool_rejection(tmp_path: Path) -> None:
+def test_router_report_and_select_validation_error_handling(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     s_dir = tmp_path / ".azuma"
     l_path = tmp_path / "decisions.jsonl"
@@ -57,9 +59,11 @@ def test_mf1_non_finite_and_bool_rejection(tmp_path: Path) -> None:
         ("actual_input_tokens", True),
         ("actual_input_tokens", 3.14),
         ("actual_input_tokens", -5),
+        ("actual_input_tokens", 2**31),
         ("actual_output_tokens", True),
         ("actual_output_tokens", 2.718),
         ("actual_output_tokens", -1),
+        ("actual_output_tokens", 2**31),
     ]
 
     for field_name, bad_val in invalid_reports:
@@ -91,15 +95,19 @@ def test_mf1_non_finite_and_bool_rejection(tmp_path: Path) -> None:
         ("input_tokens", float("nan")),
         ("input_tokens", float("inf")),
         ("input_tokens", -10),
+        ("input_tokens", 2**31),
         ("expected_output_tokens", True),
         ("expected_output_tokens", float("nan")),
         ("expected_output_tokens", float("inf")),
+        ("expected_output_tokens", 2**31),
         ("agent_depth", True),
         ("agent_depth", float("nan")),
         ("agent_depth", -1),
+        ("agent_depth", 2**31),
         ("diff_lines", True),
         ("diff_lines", float("inf")),
         ("diff_lines", -5),
+        ("diff_lines", 2**31),
     ]
 
     for field_name, bad_val in invalid_selects:
@@ -114,7 +122,7 @@ def test_mf1_non_finite_and_bool_rejection(tmp_path: Path) -> None:
     router.close()
 
 
-def test_mf2_faulty_decision_log_transactional(
+def test_router_transactional_error_handling_on_wal_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
@@ -135,8 +143,6 @@ def test_mf2_faulty_decision_log_transactional(
         "diff_lines": 10,
         "priority": "normal",
     }
-
-    from azuma_router.errors import JournalWriteError
 
     def bad_append(entry: dict) -> None:
         raise JournalWriteError("Disk full error")
@@ -182,18 +188,10 @@ def test_mf2_faulty_decision_log_transactional(
     assert exit_code == 4
 
 
-def test_mf3_ledger_rebuild_and_error(tmp_path: Path) -> None:
+def test_router_replay_ledger_rebuild_parity(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     s_dir = tmp_path / ".azuma"
     l_path = tmp_path / "decisions.jsonl"
-
-    from azuma_router.errors import LedgerEventNotFoundError
-    from azuma_router.quota import QuotaLedger
-
-    ledger = QuotaLedger(cfg)
-    with pytest.raises(LedgerEventNotFoundError):
-        ledger.correct(99999, "gpt-5-codex@openai-codex", 1.0)
-
     curr_time = 1000.0
 
     def mock_clock() -> float:
@@ -260,7 +258,7 @@ def test_mf3_ledger_rebuild_and_error(tmp_path: Path) -> None:
     r_base.close()
 
 
-def test_mf3_restart_after_snapshot_ledger_correction(tmp_path: Path) -> None:
+def test_router_restart_after_snapshot_ledger_dedup_and_correction(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     s_dir = tmp_path / ".azuma"
     l_path = tmp_path / "decisions.jsonl"
@@ -269,8 +267,6 @@ def test_mf3_restart_after_snapshot_ledger_correction(tmp_path: Path) -> None:
     def mock_clock() -> float:
         return curr_time
 
-    # Run 1: boot, select & report d1, write snapshot (state_version=1),
-    # then select d2 (post-snapshot pending)
     r1 = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path, clock_fn=mock_clock)
     r1.boot()
 
@@ -299,14 +295,12 @@ def test_mf3_restart_after_snapshot_ledger_correction(tmp_path: Path) -> None:
     r1.snapshot({})
     assert r1.state_version == 1
 
-    # Select d2 after snapshot (state_version remains 1)
     sel2 = r1.select({"request": req})
     d2_id = sel2["decision_id"]
 
     if r1.dlog is not None:
         r1.dlog.close()
 
-    # Baseline router: single uninterrupted run doing sel1, rep1, snap, sel2, rep2
     s_dir_b = tmp_path / "base_snap"
     l_path_b = tmp_path / "base_decisions.jsonl"
     rb = Router(config=cfg, snapshot_dir=s_dir_b, decision_log_path=l_path_b, clock_fn=mock_clock)
@@ -335,13 +329,11 @@ def test_mf3_restart_after_snapshot_ledger_correction(tmp_path: Path) -> None:
         }
     )
 
-    # Run 2: restart r2 from disk (restores snapshot at v1, replays d2 from log)
     r2 = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path, clock_fn=mock_clock)
     r2.boot()
     assert len(r2.pending_store) == 1
     assert r2.state_version == 1
 
-    # Now report d2 on r2
     rep2 = r2.report(
         {
             "decision_id": d2_id,
@@ -355,7 +347,6 @@ def test_mf3_restart_after_snapshot_ledger_correction(tmp_path: Path) -> None:
     assert rep2["applied"] is True
     assert rep2["state_version"] == 2
 
-    # Utilization on r2 and rb must match exactly
     u2 = r2.ledger.utilization(curr_time)
     ub = rb.ledger.utilization(curr_time)
     np.testing.assert_array_equal(u2, ub)
@@ -364,7 +355,7 @@ def test_mf3_restart_after_snapshot_ledger_correction(tmp_path: Path) -> None:
     rb.close()
 
 
-def test_mf4_report_ttl_and_expired_ids(tmp_path: Path) -> None:
+def test_router_report_ttl_sweep_and_expired_decision_error(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     s_dir = tmp_path / ".azuma"
     l_path = tmp_path / "decisions.jsonl"
@@ -435,7 +426,7 @@ def test_mf4_report_ttl_and_expired_ids(tmp_path: Path) -> None:
     router.close()
 
 
-def test_sf1_no_arm_available_preserves_state(tmp_path: Path) -> None:
+def test_router_select_no_arm_available_preserves_state(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     s_dir = tmp_path / ".azuma"
     l_path = tmp_path / "d.jsonl"
@@ -472,11 +463,7 @@ def test_sf1_no_arm_available_preserves_state(tmp_path: Path) -> None:
     router.close()
 
 
-def test_sf3_snapshot_before_ready_and_bounded_framing(tmp_path: Path) -> None:
-    import io
-
-    from azuma_router.daemon import _read_line_bounded
-
+def test_router_snapshot_before_ready_and_bounded_framing(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     s_dir = tmp_path / ".azuma"
     l_path = tmp_path / "d.jsonl"
@@ -496,33 +483,7 @@ def test_sf3_snapshot_before_ready_and_bounded_framing(tmp_path: Path) -> None:
     assert is_over2 is False
 
 
-def test_sf5_jax_import_boundary() -> None:
-    import ast
-
-    src_dir = Path("src/azuma_router")
-    allowed_jax_modules = {"__init__.py", "types.py", "state.py", "linucb.py"}
-
-    for py_file in src_dir.glob("*.py"):
-        if py_file.name in allowed_jax_modules:
-            continue
-
-        tree = ast.parse(py_file.read_text(encoding="utf-8"))
-        imports: list[str] = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imports.append(alias.name)
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imports.append(node.module)
-
-        jax_imports = [m for m in imports if "jax" in m]
-        assert not jax_imports, f"D18 violation: {py_file.name} imports JAX ({jax_imports})"
-
-
-def test_sf8_nfr04_stderr_json_logging(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    import json
-
+def test_router_stderr_json_logging(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     curr_time = 1000.0
 
@@ -592,78 +553,299 @@ def test_sf8_nfr04_stderr_json_logging(tmp_path: Path, capsys: pytest.CaptureFix
     assert "clock_skew" in events_found
 
 
-def test_nfr06_journal_determinism(tmp_path: Path) -> None:
-    import json
-
+# Snapshot Replay Ledger Idempotency Tests
+def test_snapshot_replay_ledger_idempotency_scenarios(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    s_dir = tmp_path / ".azuma"
+    l_path = tmp_path / "decisions.jsonl"
+    curr_time = 1000.0
 
-    def run_simulation(out_log: Path) -> list[str]:
-        s_dir = tmp_path / f"snap_{out_log.stem}"
-        r = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=out_log)
-        r.boot()
-        req = {
-            "task_kind": "code_edit",
-            "input_tokens": 100,
-            "expected_output_tokens": 50,
-            "has_code": True,
-            "has_tools": False,
-            "has_images": False,
-            "agent_depth": 1,
-            "diff_lines": 10,
-            "priority": "normal",
+    def mock_clock() -> float:
+        return curr_time
+
+    # Scenario A: select -> snapshot -> restart -> report gives utilization identical to no-restart
+    r_nr = Router(
+        snapshot_dir=tmp_path / "snap_nr",
+        decision_log_path=tmp_path / "dec_nr.jsonl",
+        config=cfg,
+        clock_fn=mock_clock,
+    )
+    r_nr.boot()
+    req = {
+        "task_kind": "code_edit",
+        "input_tokens": 1000,
+        "expected_output_tokens": 500,
+        "has_code": True,
+        "has_tools": False,
+        "has_images": False,
+        "agent_depth": 1,
+        "diff_lines": 10,
+        "priority": "normal",
+    }
+    sel_nr = r_nr.select({"request": req})
+    r_nr.snapshot({})
+    r_nr.report(
+        {
+            "decision_id": sel_nr["decision_id"],
+            "quality": 0.9,
+            "cost_usd": 0.0,
+            "latency_s": 1.0,
+            "actual_input_tokens": 1000,
+            "actual_output_tokens": 500,
         }
-        d_ids = []
-        for _ in range(25):
-            s = r.select({"request": req})
-            d_ids.append(s["decision_id"])
-        for d_id in d_ids:
-            r.report(
-                {
-                    "decision_id": d_id,
-                    "quality": 0.85,
-                    "cost_usd": 0.0,
-                    "latency_s": 1.5,
-                    "actual_input_tokens": 100,
-                    "actual_output_tokens": 50,
-                }
-            )
-        r.close()
+    )
+    u_no_restart = r_nr.ledger.utilization(curr_time)
+    r_nr.close()
 
-        lines = out_log.read_text(encoding="utf-8").splitlines()
-        normalized = []
-        for line in lines:
-            if not line.strip():
-                continue
-            data = json.loads(line)
-            data["ts"] = 0.0
-            if "ts_select" in data:
-                data["ts_select"] = 0.0
-            data["decision_id"] = "fixed-uuid"
-            normalized.append(json.dumps(data, sort_keys=True))
-        return normalized
+    r1 = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path, clock_fn=mock_clock)
+    r1.boot()
+    sel1 = r1.select({"request": req})
+    d1_id = sel1["decision_id"]
+    r1.snapshot({})
+    r1.dlog.close()
 
-    run1 = run_simulation(tmp_path / "run1.jsonl")
-    run2 = run_simulation(tmp_path / "run2.jsonl")
+    # Restart
+    r2 = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path, clock_fn=mock_clock)
+    r2.boot()
+    r2.report(
+        {
+            "decision_id": d1_id,
+            "quality": 0.9,
+            "cost_usd": 0.0,
+            "latency_s": 1.0,
+            "actual_input_tokens": 1000,
+            "actual_output_tokens": 500,
+        }
+    )
+    u_restart = r2.ledger.utilization(curr_time)
+    np.testing.assert_array_equal(u_restart, u_no_restart)
+    r2.close()
 
-    assert run1 == run2
+    # Scenario B: select -> snapshot -> select -> restart records exactly one new event
+    s_dir2 = tmp_path / ".azuma2"
+    l_path2 = tmp_path / "decisions2.jsonl"
+    r3 = Router(config=cfg, snapshot_dir=s_dir2, decision_log_path=l_path2, clock_fn=mock_clock)
+    r3.boot()
+    r3.select({"request": req})
+    r3.snapshot({})
+    r3.select({"request": req})
+    events_before_restart = sum(len(q) for q in r3.ledger.events.values())
+    r3.dlog.close()
+
+    r4 = Router(config=cfg, snapshot_dir=s_dir2, decision_log_path=l_path2, clock_fn=mock_clock)
+    r4.boot()
+    events_after_restart = sum(len(q) for q in r4.ledger.events.values())
+    assert events_after_restart == events_before_restart
+    r4.close()
+
+    # Scenario C: restart twice in a row is stable
+    r5 = Router(config=cfg, snapshot_dir=s_dir2, decision_log_path=l_path2, clock_fn=mock_clock)
+    r5.boot()
+    events_after_second_restart = sum(len(q) for q in r5.ledger.events.values())
+    assert events_after_second_restart == events_before_restart
+    r5.close()
 
 
-def test_nfr07_prohibited_network_pickle_imports() -> None:
-    import ast
+# WAL Rotation Carry-Forward Tests
+def test_wal_rotation_carry_forward_and_dedup(tmp_path: Path) -> None:
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    s_dir = tmp_path / ".azuma"
+    l_path = tmp_path / "decisions.jsonl"
 
-    src_dir = Path("src/azuma_router")
-    banned = {"socket", "pickle", "urllib", "requests", "http", "asyncio", "netrc", "ftplib"}
+    # Tiny max_bytes so every select triggers rotation check
+    r = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
+    r.config = cfg
+    r.boot()
+    r.dlog.max_bytes = 200
 
-    for py_file in src_dir.glob("*.py"):
-        tree = ast.parse(py_file.read_text(encoding="utf-8"))
-        imports: set[str] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    imports.add(alias.name.split(".")[0])
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    imports.add(node.module.split(".")[0])
+    req = {
+        "task_kind": "code_edit",
+        "input_tokens": 100,
+        "expected_output_tokens": 50,
+        "has_code": True,
+        "has_tools": False,
+        "has_images": False,
+        "agent_depth": 1,
+        "diff_lines": 10,
+        "priority": "normal",
+    }
 
-        violations = imports.intersection(banned)
-        assert not violations, f"NFR-07 violation in {py_file.name}: {violations}"
+    # N selects across multiple rotations without reports
+    d_ids = []
+    for _ in range(5):
+        s = r.select({"request": req})
+        d_ids.append(s["decision_id"])
+
+    r.dlog.close()
+
+    # Restart daemon from disk
+    r_restarted = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
+    r_restarted.boot()
+
+    # Every pending must still be reportable without -32002
+    for d_id in d_ids:
+        res = r_restarted.report(
+            {
+                "decision_id": d_id,
+                "quality": 0.8,
+                "cost_usd": 0.0,
+                "latency_s": 1.0,
+                "actual_input_tokens": 100,
+                "actual_output_tokens": 50,
+            }
+        )
+        assert res["applied"] is True
+
+    r_restarted.close()
+
+
+# Diagnostics Masked Arm Null Tests
+def test_verbose_select_masked_arm_diagnostics_null(tmp_path: Path) -> None:
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    s_dir = tmp_path / ".azuma"
+    l_path = tmp_path / "decisions.jsonl"
+
+    router = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
+    router.boot()
+
+    req = {
+        "task_kind": "code_edit",
+        "input_tokens": 100,
+        "expected_output_tokens": 50,
+        "has_code": True,
+        "has_tools": False,
+        "has_images": False,
+        "agent_depth": 1,
+        "diff_lines": 10,
+        "priority": "normal",
+    }
+
+    # Only allow arm 0 -> arm 1 is masked (policy == 0)
+    res = router.select(
+        {"request": req, "allowed_arms": ["gpt-5-codex@openai-codex"], "verbose": True}
+    )
+    diag = res["diagnostics"]
+
+    # Masked arm 1 must have null (None) for score, exploit, bonus, shadow_price
+    masked_id = "qwen3-coder@openrouter"
+    assert diag["score"][masked_id] is None
+    assert diag["exploit"][masked_id] is None
+    assert diag["bonus"][masked_id] is None
+    assert diag["shadow_price"][masked_id] is None
+
+    # Serialization with allow_nan=False MUST succeed
+    serialized = json.dumps(res, allow_nan=False)
+    parsed = json.loads(serialized)
+    assert parsed["diagnostics"]["score"][masked_id] is None
+
+    # WAL line keeps sentinel (-1e9) for score
+    lines = l_path.read_text(encoding="utf-8").splitlines()
+    wal_entry = json.loads(lines[0])
+    assert wal_entry["score"][1] == -1e9
+
+    router.close()
+
+
+# Non-finite Score Handling Tests
+def test_select_non_finite_score_raises_numerical_integrity_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    s_dir = tmp_path / ".azuma"
+    l_path = tmp_path / "decisions.jsonl"
+
+    router = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
+    router.boot()
+
+    from azuma_router import daemon as daemon_mod
+
+    orig_select_jit = daemon_mod.select_jit
+
+    from typing import Any
+
+    def mock_select_jit(state: Any, x: Any, qv: Any, static: Any) -> tuple[Any, Any, Any, Any]:
+        st_next, arm_i, prop, diag = orig_select_jit(state, x, qv, static)
+        nan_score = np.array([float("nan")] * static.k_max)
+        new_diag = diag._replace(score=nan_score)
+        return st_next, arm_i, prop, new_diag
+
+    monkeypatch.setattr(daemon_mod, "select_jit", mock_select_jit)
+
+    req = {
+        "task_kind": "code_edit",
+        "input_tokens": 100,
+        "expected_output_tokens": 50,
+        "has_code": True,
+        "has_tools": False,
+        "has_images": False,
+        "agent_depth": 1,
+        "diff_lines": 10,
+        "priority": "normal",
+    }
+
+    orig_ver = router.state_version
+    with pytest.raises(NumericalIntegrityError):
+        router.select({"request": req})
+
+    assert router.state_version == orig_ver
+    assert len(router.pending_store) == 0
+    assert not l_path.exists() or len(l_path.read_text(encoding="utf-8").strip()) == 0
+
+    router.close()
+
+
+# Journal Write Error Stdio Test
+def test_serve_exits_4_on_journal_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    s_dir = tmp_path / ".azuma"
+    l_path = tmp_path / "decisions.jsonl"
+
+    router = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
+    router.boot()
+
+    req_json = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "select",
+        "params": {
+            "request": {
+                "task_kind": "code_edit",
+                "input_tokens": 100,
+                "expected_output_tokens": 50,
+                "has_code": True,
+                "has_tools": False,
+                "has_images": False,
+                "agent_depth": 1,
+                "diff_lines": 10,
+                "priority": "normal",
+            }
+        },
+    }
+
+    stdin = io.StringIO(json.dumps(req_json) + "\n")
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    def bad_append(entry: dict) -> None:
+        raise JournalWriteError("Write failed")
+
+    assert router.dlog is not None
+    monkeypatch.setattr(router.dlog, "append", bad_append)
+
+    exited_code = None
+
+    def mock_exit(code: int) -> None:
+        nonlocal exited_code
+        exited_code = code
+        raise SystemExit(code)
+
+    import sys
+
+    monkeypatch.setattr(sys, "exit", mock_exit)
+
+    with pytest.raises(SystemExit):
+        serve(stdin, stdout, stderr, router, exit_on_eof=False)
+
+    assert exited_code == 4

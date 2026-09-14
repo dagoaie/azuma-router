@@ -36,6 +36,10 @@ class JournalWriteError(AzumaError):
     """Fatal failure writing or flushing to the decision journal (WAL)."""
 
 
+class NumericalIntegrityError(AzumaError):
+    """Non-finite score or numerical overflow detected (MF-4)."""
+
+
 class LedgerEventNotFoundError(AzumaError):
     """Target ledger event_id was not found in QuotaLedger (FR-16 / MF-3)."""
 

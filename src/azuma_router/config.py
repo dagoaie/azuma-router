@@ -3,6 +3,7 @@
 Strict parsing according to contract §4.1 and ADR-0012, ADR-0017.
 """
 
+import math
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime
@@ -78,8 +79,12 @@ class Config:
 
 
 def _check_type(val: Any, expected_type: type | tuple[type, ...], field_path: str) -> None:
+    if isinstance(val, bool) and expected_type is not bool:
+        raise ConfigError(field_path, f"Expected {expected_type}, got bool")
     if not isinstance(val, expected_type):
         raise ConfigError(field_path, f"Expected {expected_type}, got {type(val).__name__}")
+    if isinstance(val, float) and not math.isfinite(val):
+        raise ConfigError(field_path, f"Float values must be finite, got {val}")
 
 
 def _req_dict_val(
@@ -92,6 +97,8 @@ def _req_dict_val(
     if name not in data_dict:
         raise ConfigError(full_path, f"Missing mandatory field '{full_path}'")
     val = data_dict[name]
+    if isinstance(val, bool) and types is not bool:
+        raise ConfigError(full_path, f"Expected {types}, got bool")
     if types is float and isinstance(val, int) and not isinstance(val, bool):
         val = float(val)
     _check_type(val, types, full_path)
@@ -207,9 +214,11 @@ def _parse_window_config(w_data: Any, w_prefix: str) -> WindowConfig:
     cap = w_data.get("capacity")
     if cap is None:
         raise ConfigError(f"{w_prefix}.capacity", "Missing mandatory field 'capacity'")
-    if isinstance(cap, int) and not isinstance(cap, bool):
+    if isinstance(cap, bool):
+        raise ConfigError(f"{w_prefix}.capacity", "capacity cannot be bool")
+    if isinstance(cap, int):
         cap = float(cap)
-    if not isinstance(cap, float) or cap <= 0:
+    if not isinstance(cap, float) or not math.isfinite(cap) or cap <= 0:
         raise ConfigError(f"{w_prefix}.capacity", "capacity must be a float > 0")
 
     duration_s: int | None = None
@@ -218,7 +227,12 @@ def _parse_window_config(w_data: Any, w_prefix: str) -> WindowConfig:
 
     if kind == "rolling":
         duration_s = w_data.get("duration_s")
-        if duration_s is None or not isinstance(duration_s, int) or duration_s <= 0:
+        if (
+            duration_s is None
+            or isinstance(duration_s, bool)
+            or not isinstance(duration_s, int)
+            or duration_s <= 0
+        ):
             msg = "rolling window requires duration_s int > 0"
             raise ConfigError(f"{w_prefix}.duration_s", msg)
     elif kind == "fixed_reset":
@@ -345,7 +359,7 @@ def load_config(path: str | Path) -> Config:
     if "schema_version" not in data:
         raise ConfigError("schema_version", "Missing mandatory field 'schema_version'")
     schema_ver = data["schema_version"]
-    if not isinstance(schema_ver, int) or schema_ver != 1:
+    if isinstance(schema_ver, bool) or not isinstance(schema_ver, int) or schema_ver != 1:
         raise ConfigError("schema_version", f"schema_version must be 1, got {schema_ver!r}")
 
     # [bandit]
