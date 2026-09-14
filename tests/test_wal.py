@@ -1,0 +1,117 @@
+"""Tests for DecisionLog WAL and PendingStore (T16 & T17)."""
+
+import json
+from pathlib import Path
+
+from azuma_router.types import Pending
+from azuma_router.wal import DecisionLog, PendingStore
+
+
+def test_decision_log_append_flush_ac17(tmp_path: Path) -> None:
+    log_path = tmp_path / "decisions.jsonl"
+    dlog = DecisionLog(path=log_path, max_bytes=1000)
+
+    # Spy on flush
+    flushed = False
+    original_flush = dlog.file.flush
+
+    def spy_flush() -> None:
+        nonlocal flushed
+        original_flush()
+        flushed = True
+
+    dlog.file.flush = spy_flush
+
+    entry = {
+        "phase": "select",
+        "decision_id": "018f6c2e-0000-7000-8000-000000000001",
+        "ts": 1757800000.0,
+        "state_version": 0,
+        "arm_index": 0,
+        "arm_id": "gpt-5-codex@openai-codex",
+        "propensity": 0.8123,
+        "x": [1.0] * 32,
+        "policy": [0.8123, 0.1877],
+        "score": [0.71, 0.44],
+        "exploit": [0.5, 0.3],
+        "bonus": [0.21, 0.14],
+        "shadow_price": [0.0, 0.0],
+        "utilization": {"gpt-5-codex@openai-codex": [0.0, 0.0]},
+        "est_units": 1.0,
+        "featurizer_version": 1,
+    }
+
+    dlog.append(entry)
+    assert flushed is True
+
+    # Read back file content
+    with log_path.open() as f:
+        lines = f.readlines()
+    assert len(lines) == 1
+
+    parsed = json.loads(lines[0])
+    assert parsed["phase"] == "select"
+    assert parsed["decision_id"] == "018f6c2e-0000-7000-8000-000000000001"
+    dlog.close()
+
+
+def test_decision_log_rotation(tmp_path: Path) -> None:
+    log_path = tmp_path / "decisions.jsonl"
+    # Small max_bytes to trigger rotation after single report entry
+    dlog = DecisionLog(path=log_path, max_bytes=50)
+
+    select_entry = {
+        "phase": "select",
+        "decision_id": "018f6c2e-0000-7000-8000-000000000001",
+        "ts": 1757800000.0,
+        "state_version": 0,
+    }
+    report_entry = {
+        "phase": "report",
+        "decision_id": "018f6c2e-0000-7000-8000-000000000001",
+        "ts": 1757800010.0,
+        "state_version": 1,
+    }
+
+    dlog.append(select_entry)
+    # Rotation only evaluated after report or expire
+    dlog.append(report_entry)
+
+    rotated_path = tmp_path / "decisions.1.jsonl"
+    assert rotated_path.exists()
+    dlog.close()
+
+
+def test_pending_store_sweep() -> None:
+    store = PendingStore()
+    p1 = Pending(
+        decision_id="id-1",
+        arm_index=0,
+        x=[1.0] * 32,
+        propensity=0.8,
+        ts_select=100.0,
+        est_units=1.0,
+        ledger_event_id=1,
+        state_version=0,
+    )
+    p2 = Pending(
+        decision_id="id-2",
+        arm_index=1,
+        x=[1.0] * 32,
+        propensity=0.2,
+        ts_select=200.0,
+        est_units=1.0,
+        ledger_event_id=2,
+        state_version=0,
+    )
+
+    store.put(p1)
+    store.put(p2)
+    assert len(store) == 2
+
+    # Sweep at now = 150.0, ttl = 30.0 -> p1 expired (now - ts = 50 > 30), p2 kept (150 - 200 < 0)
+    expired = store.sweep(now=150.0, ttl_s=30.0)
+    assert len(expired) == 1
+    assert expired[0].decision_id == "id-1"
+    assert len(store) == 1
+    assert "id-2" in store

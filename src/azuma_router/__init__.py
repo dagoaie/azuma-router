@@ -9,6 +9,11 @@ import jax
 # jax.config.update is untyped upstream; this is the canonical x64 switch (ADR-0018).
 jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
 
+from azuma_router.linucb import select, update  # noqa: E402
+from azuma_router.quota import QuotaLedger  # noqa: E402
+from azuma_router.snapshot import restore, snapshot  # noqa: E402
+from azuma_router.types import BanditState, StaticConfig  # noqa: E402
+
 __all__ = [
     "BanditState",
     "QuotaLedger",

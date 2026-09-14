@@ -23,6 +23,9 @@ def test_importing_package_enables_float64() -> None:
 
 def test_public_api_is_exactly_the_adr_0012_surface() -> None:
     assert set(azuma_router.__all__) == PUBLIC_API
+    for name in PUBLIC_API:
+        assert hasattr(azuma_router, name)
+        assert getattr(azuma_router, name) is not None
 
 
 def test_every_domain_error_derives_from_azuma_error() -> None:

@@ -1,0 +1,11 @@
+schema_version = 1
+
+[[arms]]
+model_id = "qwen3-coder"
+provider = "openrouter"
+billing_mode = "per_token"
+price_in_per_1m = 0.30
+price_out_per_1m = 1.20
+units_per_request = 0.0
+units_per_1k_tokens = 0.0
+barrier_mu = 0.0

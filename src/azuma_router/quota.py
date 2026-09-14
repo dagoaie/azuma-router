@@ -1,0 +1,178 @@
+"""Quota ledger, windowing calculations, and shadow pricing barrier.
+
+Complies with contract §3.4, §4.2, FR-14..FR-17, ADR-0005, ADR-0006.
+"""
+
+import math
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+import numpy as np
+
+from azuma_router.config import ArmConfig, Config
+
+
+@dataclass
+class LedgerEvent:
+    """Single consumption entry in the ledger."""
+
+    event_id: int
+    arm_id: str
+    units: float
+    ts: float
+
+
+def log_barrier(u: float | np.ndarray, mu: float | np.ndarray) -> float | np.ndarray:
+    """Logarithmic convex barrier shadow price penalty (ADR-0006)."""
+    u_clip = np.clip(u, 0.0, 1.0 - 1e-6)
+    return -mu * np.log(1.0 - u_clip)
+
+
+def calc_est_units(
+    arm: ArmConfig,
+    input_tokens: int,
+    expected_output_tokens: int | None,
+) -> float:
+    """Estimates consumption units for a request on a given arm."""
+    if arm.billing_mode != "subscription":
+        return 0.0
+    out_toks = expected_output_tokens if expected_output_tokens is not None else 0
+    tot_toks = input_tokens + out_toks
+    return arm.units_per_request + (arm.units_per_1k_tokens * float(tot_toks) / 1000.0)
+
+
+def _get_period_seconds(period: str | None) -> float:
+    """Returns period duration in seconds for daily or weekly reset windows."""
+    return 86400.0 if period == "daily" else 604800.0
+
+
+class QuotaLedger:
+    """In-memory exact ledger tracking per-arm consumption across rolling & fixed windows.
+
+    Complies with ADR-0005.
+    """
+
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self._next_event_id: int = 1
+        self.events: dict[str, deque[LedgerEvent]] = {arm.arm_id: deque() for arm in config.arms}
+
+    def record(self, arm_id: str, units: float, ts: float) -> int:
+        """Records an estimated or final consumption event."""
+        if arm_id not in self.events:
+            self.events[arm_id] = deque()
+
+        eid = self._next_event_id
+        self._next_event_id += 1
+
+        ev = LedgerEvent(event_id=eid, arm_id=arm_id, units=units, ts=ts)
+        self.events[arm_id].append(ev)
+        return eid
+
+    def correct(self, event_id: int, arm_id: str, actual_units: float) -> None:
+        """Corrects an existing ledger event in-place with actual observed units (FR-16)."""
+        if arm_id not in self.events:
+            return
+
+        for ev in self.events[arm_id]:
+            if ev.event_id == event_id:
+                ev.units = actual_units
+                return
+
+    def _get_max_window_duration_s(self, arm: ArmConfig) -> float:
+        """Calculates max history window duration in seconds needed for pruning."""
+        max_dur = 0.0
+        for w in arm.windows:
+            if w.kind == "rolling" and w.duration_s is not None:
+                max_dur = max(max_dur, float(w.duration_s))
+            elif w.kind == "fixed_reset":
+                # Max duration for daily is 86400, weekly is 604800
+                period_s = _get_period_seconds(w.period)
+                max_dur = max(max_dur, period_s * 2)
+        return max_dur
+
+    def utilization(self, now: float) -> np.ndarray:
+        """Computes float32[k_max, w_max] utilization view at current timestamp (FR-14)."""
+        k_max = self.config.bandit.k_max
+        w_max = self.config.bandit.w_max
+        util = np.zeros((k_max, w_max), dtype=np.float32)
+
+        for i, arm in enumerate(self.config.arms):
+            if arm.billing_mode != "subscription" or not arm.windows:
+                continue
+
+            arm_events = self.events.get(arm.arm_id, deque())
+            max_dur = self._get_max_window_duration_s(arm)
+
+            # Prune events older than max_dur
+            if max_dur > 0:
+                cutoff = now - max_dur
+                while arm_events and arm_events[0].ts < cutoff:
+                    arm_events.popleft()
+
+            for j, w in enumerate(arm.windows):
+                if j >= w_max:
+                    break
+
+                if w.kind == "rolling":
+                    dur = float(w.duration_s or 0)
+                    cutoff = now - dur
+                    consumed = sum(ev.units for ev in arm_events if ev.ts >= cutoff)
+                elif w.kind == "fixed_reset":
+                    period_s = _get_period_seconds(w.period)
+                    anchor_str = (w.reset_anchor or "").replace("Z", "+00:00")
+                    anchor_dt = datetime.fromisoformat(anchor_str)
+                    anchor_ts = anchor_dt.timestamp()
+
+                    if now >= anchor_ts:
+                        periods_elapsed = math.floor((now - anchor_ts) / period_s)
+                        last_reset_ts = anchor_ts + float(periods_elapsed) * period_s
+                    else:
+                        last_reset_ts = anchor_ts
+
+                    consumed = sum(ev.units for ev in arm_events if ev.ts >= last_reset_ts)
+                else:
+                    consumed = 0.0
+
+                util[i, j] = np.float32(consumed / w.capacity)
+
+        return util
+
+    def dump(self) -> dict[str, Any]:
+        """Serializes current active ledger state for snapshot metadata (FR-27)."""
+        serialized: dict[str, Any] = {}
+        for arm_id, ev_queue in self.events.items():
+            serialized[arm_id] = [
+                {
+                    "event_id": ev.event_id,
+                    "arm_id": ev.arm_id,
+                    "units": ev.units,
+                    "ts": ev.ts,
+                }
+                for ev in ev_queue
+            ]
+        return {"next_event_id": self._next_event_id, "events": serialized}
+
+    @classmethod
+    def load(cls, data: dict[str, Any], config: Config) -> "QuotaLedger":
+        """Restores QuotaLedger state from snapshot dump data."""
+        ledger = cls(config)
+        ledger._next_event_id = data.get("next_event_id", 1)
+        raw_events = data.get("events", {})
+
+        for arm_id, ev_list in raw_events.items():
+            queue: deque[LedgerEvent] = deque()
+            for item in ev_list:
+                queue.append(
+                    LedgerEvent(
+                        event_id=item["event_id"],
+                        arm_id=item["arm_id"],
+                        units=float(item["units"]),
+                        ts=float(item["ts"]),
+                    )
+                )
+            ledger.events[arm_id] = queue
+
+        return ledger
