@@ -3,13 +3,13 @@
 | Campo | Valor |
 |---|---|
 | Tier | A (arquitectura fundacional) |
-| Estado | CERRADA (Fase 0) — Grill R1 y R2 aprobados 2026-09-14; especificación en `specs/core/` |
+| Estado | CERRADA (Fase 0) — Grill R1 y R2 aprobados 2026-09-14; change OpenSpec `linucb-core` (`openspec/changes/linucb-core/`), contratos en `docs/contracts/linucb-core.md`, plan en `proposal/tier-a/0001-plan.md` |
 | Autor | David González |
 | Fecha | 2026-09-14 |
 | Vocabulario | `CONTEXT.md` (fuente de verdad de términos) |
 | ADRs | `docs/adr/0001` … `0018` (ver `docs/adr/README.md`) |
 
-> Convención: cada decisión cita su ADR como `(ADR-000N)`. Contratos exactos en `specs/core/spec.md`.
+> Convención: cada decisión cita su ADR como `(ADR-000N)`. Contratos exactos en `docs/contracts/linucb-core.md`.
 
 ---
 
@@ -226,7 +226,7 @@ Cross-checks:
 
 1. ~~Grill Ronda 1~~ — aprobado 2026-09-14; ADR-0001…0012 registrados.
 2. ~~Grill Ronda 2~~ — aprobado 2026-09-14; ADR-0013…0018 registrados.
-3. Commit de Fase 0 en `main` (`docs: phase 0 proposal, glossary and adrs`) y rama `feat/0001-linucb-core`.
-4. `specs/core/{spec,design,tasks}.md` (Fase 1) para los contratos con tipos exactos (`BanditState`, `QuotaView`, mensajes del daemon).
+3. Commit de Fase 0 en `main` (`docs: phase 0 proposal, glossary and adrs`), bootstrap del toolchain (`chore: scaffold package, toolchain and ci`) y rama `feat/linucb-core` creada por `convoy spin`.
+4. `docs/contracts/linucb-core.md` (contratos con tipos exactos) y `openspec/changes/linucb-core/{proposal,design,tasks}.md` + `specs/*/spec.md` (Fase 1) (`BanditState`, `QuotaView`, mensajes del daemon).
 5. `write-plan` → slices verticales: (S1) state + linucb + tests numéricos; (S2) quota + reward; (S3) snapshot + OPE; (S4) daemon contract.
 6. `implement` en worktree `wt switch --create azuma-router.0001-feat-linucb-core` bajo TDD estricto.

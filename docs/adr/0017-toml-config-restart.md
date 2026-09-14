@@ -3,7 +3,7 @@
 **Estado:** Aceptado (Grill R2 · Q17) · 2026-09-14 · **Decisión arquitectónica definitiva**
 
 ## Decisión
-- Fichero TOML (stdlib `tomllib`) pasado por `--config`. Secciones `[bandit]`, `[[arms]]`, `[[arms.windows]]`. Schema exacto en `specs/core/spec.md`.
+- Fichero TOML (stdlib `tomllib`) pasado por `--config`. Secciones `[bandit]`, `[[arms]]`, `[[arms.windows]]`. Schema exacto en `docs/contracts/linucb-core.md`.
 - `arm_id = "{model_id}@{provider}"`, único. El orden de `[[arms]]` define el índice $a$.
 - El snapshot guarda `arm_ids: list[str]` ordenada; en `restore`, si difiere del config ⇒ `IncompatibleSnapshotError`.
 - Cualquier cambio en `azuma.toml` requiere reiniciar el daemon.

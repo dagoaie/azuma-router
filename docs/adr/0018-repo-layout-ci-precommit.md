@@ -8,7 +8,7 @@
 - CI GitHub Actions: matriz `{3.12, 3.13} × {ubuntu-latest, macos-latest}`; jobs `lint`, `typecheck`, `test`, `bench` (bench solo informa, no falla en CI).
 - `jax.config.update("jax_enable_x64", True)` en `azuma_router/__init__.py`; test que importa el paquete y verifica `jnp.zeros(1).dtype == float64`.
 - `.pre-commit-config.yaml` con `ruff` (lint+format) y `mypy --strict` desde el primer commit.
-- Rama de trabajo del slice S1: `feat/0001-linucb-core` desde el commit de Fase 0 en `main`.
+- Rama de trabajo del slice S1: `feat/linucb-core` (creada por `convoy spin` desde `main`, que incluye el commit de Fase 0 y el bootstrap del toolchain).
 
 ## Porqué
 Layout `src/` evita importar el paquete sin instalar; x64 en `__init__` garantiza que ningún módulo cree arrays float32 por accidente antes de la activación.

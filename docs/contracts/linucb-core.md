@@ -1,12 +1,12 @@
-# Feature Spec: azuma-router core (slice 0001)
+# Contratos: azuma-router core (slice 0001)
 
 | Campo | Valor |
 |---|---|
 | Ficha | `proposal/tier-a/0001-azuma-linucb-core.md` |
 | ADRs vinculantes | `docs/adr/0001` … `0018` |
 | Vocabulario | `CONTEXT.md` |
-| Rama | `feat/0001-linucb-core` |
-| Estado | BORRADOR para aprobación (Fase 1) |
+| Rama | `feat/linucb-core` (vía `convoy spin`) |
+| Estado | APROBADA (Fase 1, 2026-09-14) — requisitos normativos en `openspec/changes/linucb-core/specs/*/spec.md`; este fichero conserva los contratos exactos (TOML, tipos, payloads, edge cases, AC) |
 
 Todo requisito lleva identificador `FR-nn` (funcional) o `NFR-nn` (no funcional) y se cruza con `tasks.md`. "DEBE"/"NUNCA" son normativos.
 
