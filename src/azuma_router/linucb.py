@@ -15,18 +15,21 @@ def _score_single_arm(
     a_arm: jnp.ndarray,
     b_a: jnp.ndarray,
     x: jnp.ndarray,
-    alpha: float,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Solves ridge estimator via Cholesky decomposition for a single arm (ADR-0002)."""
+    """Solves ridge estimator via Cholesky decomposition for a single arm (ADR-0002).
+
+    Returns the unscaled confidence radius, not the alpha-scaled bonus: OPE needs the radius on
+    its own to rebuild a candidate's exploration term from a log written under a different alpha,
+    including alpha=0 (OPE-1)."""
     l_factor, lower = jax.scipy.linalg.cho_factor(a_arm, lower=True)
     theta_hat = jax.scipy.linalg.cho_solve((l_factor, lower), b_a)
     exploit = jnp.dot(x, theta_hat)
     z = jax.scipy.linalg.solve_triangular(l_factor, x, lower=True)
-    bonus = alpha * jnp.sqrt(jnp.maximum(jnp.sum(z**2), 0.0))
-    return exploit, bonus
+    radius = jnp.sqrt(jnp.maximum(jnp.sum(z**2), 0.0))
+    return exploit, radius
 
 
-_vmap_score_arms = jax.vmap(_score_single_arm, in_axes=(0, 0, None, None))
+_vmap_score_arms = jax.vmap(_score_single_arm, in_axes=(0, 0, None))
 
 
 def _select_pure(
@@ -36,7 +39,8 @@ def _select_pure(
     static: StaticConfig,
 ) -> tuple[BanditState, jnp.ndarray, float | jnp.ndarray, Diagnostics]:
     """Pure JAX LinUCB select step (ADR-0001, ADR-0008)."""
-    exploit, bonus = _vmap_score_arms(state.A, state.b, x, static.alpha)
+    exploit, radius = _vmap_score_arms(state.A, state.b, x)
+    bonus = static.alpha * radius
 
     # Shadow price via log barrier (ADR-0006)
     barrier_mu = jnp.array(static.barrier_mu, dtype=F64)
@@ -91,6 +95,8 @@ def _select_pure(
     diagnostics = Diagnostics(
         exploit=exploit,
         bonus=bonus,
+        radius=radius,
+        active=active,
         shadow_price=shadow_price,
         score=score,
         policy=out_policy,

@@ -12,7 +12,7 @@ Núcleo LinUCB disjunto compilado en JAX: estado inmutable PyTree con formas est
 - **THEN** `A.shape == (32, 32, 32)`, `A.dtype == float64`, `A[0] == I`, `mask[:2].all()` y `not mask[2:].any()` (AC-06)
 
 ### Requirement: Puntuación UCB por brazo
-`select(state, x, quota_view, static)` SHALL calcular por brazo, mediante `cho_factor`/`cho_solve` y `solve_triangular` en float64: `exploit = x·θ̂` con `θ̂ = A⁻¹b`, `bonus = alpha·sqrt(x·A⁻¹x)`, `shadow = max_W −μ_a·ln(1−u_{a,W})` y `score = exploit + bonus − shadow·est_units`. Brazos inactivos (padding, no permitidos o con `u ≥ 1` en alguna ventana) SHALL recibir `score = −inf` (FR-08).
+`select(state, x, quota_view, static)` SHALL calcular por brazo, mediante `cho_factor`/`cho_solve` y `solve_triangular` en float64: `radius = sqrt(x·A⁻¹x)`, `exploit = x·θ̂` con `θ̂ = A⁻¹b`, `bonus = alpha·radius`, `shadow = max_W −μ_a·ln(1−u_{a,W})` y `score = exploit + bonus − shadow·est_units`. Brazos inactivos (padding, no permitidos o con `u ≥ 1` en alguna ventana) SHALL recibir `score = −inf`, y la máscara estructural (mask ∧ allowed ∧ ¬exhausted) SHALL exponerse como `diagnostics.active`. `diagnostics.radius` SHALL exponer la magnitud sin escalar por `alpha`, para que el journal (decision-journal) y `ope.evaluate` (off-policy-evaluation) puedan reconstruir el bonus de un `alpha` distinto (FR-08).
 
 #### Scenario: bonus con prior identidad
 - **WHEN** `A = I`, `b = 0`, `alpha = 1` y todas las utilizaciones son `0`

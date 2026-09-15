@@ -191,6 +191,8 @@ class Diagnostics(NamedTuple):
 
     exploit: jnp.ndarray  # f64[k_max]
     bonus: jnp.ndarray  # f64[k_max]
+    radius: jnp.ndarray  # f64[k_max], unscaled confidence radius: bonus == alpha * radius (OPE-1)
+    active: jnp.ndarray  # bool[k_max], structurally active mask (mask & allowed & !exhausted)
     shadow_price: jnp.ndarray  # f64[k_max]
     score: jnp.ndarray  # f64[k_max]
     policy: jnp.ndarray  # f64[k_max]

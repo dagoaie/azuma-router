@@ -67,29 +67,28 @@ def evaluate(
         logged_bonus = np.array(s_entry["bonus"], dtype=np.float64)
         logged_score = np.array(s_entry["score"], dtype=np.float64)
 
-        # Reconstruct candidate bonus
-        logged_alpha = float(s_entry.get("alpha", 1.0))
-        if logged_alpha > 0.0:
-            bonus_cand = logged_bonus * (candidate_static.alpha / logged_alpha)
-        else:
-            bonus_cand = logged_bonus
+        # Reconstruct the candidate's exploration term from the persisted, unscaled radius: the
+        # logged bonus alone cannot be rescaled once logged_alpha is 0 (OPE-1).
+        radius = np.array(s_entry["radius"], dtype=np.float64)
+        bonus_cand = candidate_static.alpha * radius
 
         # The logged score already includes each arm's quota penalty. Candidate evaluation changes
         # only the exploration term, so it must not use the selected arm's units for every arm.
         score_cand = logged_score + bonus_cand - logged_bonus
 
-        # Active arms from logged policy
-        logged_policy = np.array(s_entry["policy"], dtype=np.float64)
-        active = logged_policy > 0.0
+        # Active arms come from the persisted structural mask, not the logged policy: an active
+        # arm's policy can underflow to 0 under a zero epsilon_floor or a heavy quota penalty,
+        # which would otherwise misclassify it as inactive (OPE-2).
+        active = np.array(s_entry["active"], dtype=bool)
         k_act = int(np.sum(active))
 
         if k_act == 0:
             continue
 
-        logits = score_cand / candidate_static.tau
-        logits_safe = np.where(active, logits, -1e9)
-        max_logit = np.max(logits_safe)
-        exp_logits = np.where(active, np.exp(logits - max_logit), 0.0)
+        # Subtract the max *before* dividing by tau, mirroring linucb.py's online path
+        # (R4-SF-1): a tiny tau can only push a logit to -inf, never to inf - inf = NaN.
+        max_score = np.max(np.where(active, score_cand, -np.inf))
+        exp_logits = np.where(active, np.exp((score_cand - max_score) / candidate_static.tau), 0.0)
         sum_exp = np.sum(exp_logits)
         p_softmax = np.where(sum_exp > 0.0, exp_logits / sum_exp, 0.0)
 

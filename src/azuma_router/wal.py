@@ -293,6 +293,20 @@ def _finite_vector(value: object, key: str, d_id: str, length: int) -> None:
         _finite(component, key, d_id)
 
 
+def _nonnegative_vector(value: object, key: str, d_id: str, length: int) -> None:
+    _finite_vector(value, key, d_id, length)
+    assert isinstance(value, list)
+    if any(component < 0.0 for component in value):
+        raise ValueError(f"WAL line for decision {d_id}: {key!r} must be non-negative")
+
+
+def _bool_vector(value: object, key: str, d_id: str, length: int) -> None:
+    if not isinstance(value, list) or len(value) != length:
+        raise ValueError(f"WAL line for decision {d_id}: {key!r} must have {length} components")
+    if any(not isinstance(component, bool) for component in value):
+        raise ValueError(f"WAL line for decision {d_id}: {key!r} must be a list of booleans")
+
+
 def _validate_utilization(value: object, d_id: str, config: Config) -> None:
     if not isinstance(value, dict) or set(value) != {arm.arm_id for arm in config.arms}:
         raise ValueError(f"WAL select for decision {d_id}: 'utilization' must be an object")
@@ -335,6 +349,8 @@ def _decode_select(entry: dict[str, Any], config: Config) -> Pending:
             "score",
             "exploit",
             "bonus",
+            "radius",
+            "active",
             "shadow_price",
             "utilization",
             "est_units",
@@ -348,6 +364,8 @@ def _decode_select(entry: dict[str, Any], config: Config) -> Pending:
     _finite(entry["alpha"], "alpha", d_id)
     for key in ("policy", "score", "exploit", "bonus", "shadow_price"):
         _finite_vector(entry[key], key, d_id, config.bandit.k_max)
+    _nonnegative_vector(entry["radius"], "radius", d_id, config.bandit.k_max)
+    _bool_vector(entry["active"], "active", d_id, config.bandit.k_max)
     _validate_utilization(entry["utilization"], d_id, config)
     if _integer(entry, "featurizer_version", d_id, minimum=1) != FEATURIZER_VERSION:
         raise ValueError(f"WAL select for decision {d_id}: unsupported featurizer_version")

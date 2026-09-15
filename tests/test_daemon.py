@@ -971,12 +971,68 @@ def test_boot_rejects_an_inconsistent_post_snapshot_select_state_version(
 
 
 def test_snapshot_fails_when_the_wal_is_closed(tmp_path: Path) -> None:
+    """A pre-publication WAL sync failure is a snapshot-step failure, not a journal error (SNAP-1):
+    FR-25 classifies any failure inside the snapshot step as snapshot_write_error, no retry."""
     router = _booted_router(tmp_path)
     assert router.dlog is not None
     router.dlog.close()
 
-    with pytest.raises(JournalWriteError, match="WAL sync failed"):
+    with pytest.raises(SnapshotWriteError, match="WAL sync failed"):
         router.snapshot({})
+
+
+def test_snapshot_rpc_reports_snapshot_write_error_once_without_retrying_the_failed_sync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SNAP-1: a failing sync must not be re-invoked by close()'s own shutdown snapshot attempt."""
+    router = _booted_router(tmp_path)
+    assert router.dlog is not None
+    sync_calls: list[None] = []
+
+    def failing_sync() -> None:
+        sync_calls.append(None)
+        raise JournalWriteError("disk full")
+
+    monkeypatch.setattr(router.dlog, "sync", failing_sync)
+
+    code, events = _serve_one_request(router, "snapshot", {})
+
+    assert code == 4
+    assert sync_calls == [None]  # exactly one sync attempt, never retried via close()
+    error_events = [e["event"] for e in events if e["level"] == "error"]
+    assert error_events == ["snapshot_write_error"]
+    assert "shutdown_snapshot_failed" not in error_events
+    assert "journal_write_error" not in error_events
+
+
+def test_report_triggered_cadence_snapshot_reports_snapshot_write_error_not_journal_write_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SNAP-1 also covers the FR-28 cadence snapshot taken from inside report(), not just the
+    RPC."""
+    cfg = load_fixture_config_with(
+        tmp_path, **{"snapshot_every_updates = 100": "snapshot_every_updates = 1"}
+    )
+    router = Router(
+        config=cfg,
+        snapshot_dir=tmp_path / ".azuma",
+        decision_log_path=tmp_path / "decisions.jsonl",
+    )
+    router.boot()
+    assert router.dlog is not None
+    d_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+
+    def failing_sync() -> None:
+        raise JournalWriteError("disk full")
+
+    monkeypatch.setattr(router.dlog, "sync", failing_sync)
+
+    code, events = _serve_one_request(router, "report", _report_params(d_id))
+
+    assert code == 4
+    error_events = [e["event"] for e in events if e["level"] == "error"]
+    assert error_events == ["snapshot_write_error"]
+    assert "journal_write_error" not in error_events
 
 
 def test_boot_exits_3_on_recursively_nested_journal_json(

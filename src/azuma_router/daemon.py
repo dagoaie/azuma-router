@@ -437,7 +437,10 @@ class Router:
             arm.arm_id: util_matrix[idx, : len(arm.windows)].tolist()
             for idx, arm in enumerate(self.config.arms)
         }
-        score_logged = np.where(np.array(diag.policy) > 0, np.array(diag.score), -1e9)
+        # Sentinel by the real active mask, not by a possibly-underflowed policy (OPE-2): an
+        # active arm's score must survive even when epsilon_floor gave it zero policy mass.
+        active_arr = np.array(diag.active)
+        score_logged = np.where(active_arr, np.array(diag.score), -1e9)
         select_entry = {
             "phase": "select",
             "decision_id": d_id,
@@ -452,6 +455,8 @@ class Router:
             "score": score_logged.tolist(),
             "exploit": np.array(diag.exploit).tolist(),
             "bonus": np.array(diag.bonus).tolist(),
+            "radius": np.array(diag.radius).tolist(),
+            "active": active_arr.tolist(),
             "shadow_price": np.array(diag.shadow_price).tolist(),
             "utilization": util_dict,
             "est_units": est_u,
@@ -667,7 +672,12 @@ class Router:
         )
 
         if self.dlog is not None:
-            self.dlog.sync()
+            # A pre-publication sync failure is a snapshot-step failure (FR-25): translate it here
+            # so it is never misfiled as journal_write_error and retried through close() (SNAP-1).
+            try:
+                self.dlog.sync()
+            except JournalWriteError as err:
+                raise SnapshotWriteError(f"snapshot sync failed: {err}") from err
         target_path, n_bytes = write_snapshot(self.snapshot_dir, self.state, self.ledger, meta)
         self.updates_since_snapshot = 0
         self.last_snapshot_ts = now

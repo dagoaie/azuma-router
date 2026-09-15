@@ -36,7 +36,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 
 ### 3.3 Bandido (ADR-0001, 0002, 0008)
 - **FR-07** `init_state(config) -> BanditState` DEBE devolver `A[a] = ridge_lambda · I` para todo `a`, `b = 0`, `n_pulls = 0`, `mask[a] = True` para `a < K` y `False` para el padding, `rng_key = PRNGKey(seed)`.
-- **FR-08** `select(state, x, quota_view, static) -> (state', arm, propensity, diagnostics)` DEBE calcular por brazo `exploit = x·θ̂`, `bonus = alpha·sqrt(x·A⁻¹x)`, `shadow = max_W −μ_a·ln(1−u)`, `score = exploit + bonus − shadow·est_units`, enmascarar con `−inf`, y muestrear con $\pi = (1-\varepsilon)\,\mathrm{softmax}(\text{score}/\tau) + \varepsilon/K_{act}$.
+- **FR-08** `select(state, x, quota_view, static) -> (state', arm, propensity, diagnostics)` DEBE calcular por brazo `radius = sqrt(x·A⁻¹x)`, `exploit = x·θ̂`, `bonus = alpha·radius`, `shadow = max_W −μ_a·ln(1−u)`, `score = exploit + bonus − shadow·est_units`, enmascarar con `−inf`, y muestrear con $\pi = (1-\varepsilon)\,\mathrm{softmax}(\text{score}/\tau) + \varepsilon/K_{act}$. `diagnostics` DEBE incluir tanto `radius` (sin escalar por `alpha`) como `active` (máscara estructural: mask ∧ allowed ∧ ¬exhausted) además de `bonus`, para que el journal (§4.4) persista ambos y `ope.evaluate` (FR-34) pueda reconstruir el bonus de un candidato con otro `alpha`, incluido `alpha = 0`.
 - **FR-09** `select` DEBE ser una función pura: mismo `(state, x, quota_view)` ⇒ misma salida bitwise. `state'.rng_key` DEBE diferir de `state.rng_key`; todo lo demás igual.
 - **FR-10** Si `quota_view.mask_override` (derivado de `allowed_arms`) y la máscara del estado dejan 0 brazos activos, `select` DEBE señalar `no_arm_available = True` en `diagnostics` y el daemon DEBE responder `-32004`.
 - **FR-11** `update(state, x, arm, reward, static) -> state'` DEBE producir `A'[arm] = A[arm] + x xᵀ`, `b'[arm] = b[arm] + reward·x`, `n_pulls'[arm] += 1`, y dejar los demás brazos bitwise iguales.
@@ -76,7 +76,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 - **FR-33** Batch JSON-RPC (array) NO se soporta ⇒ `-32600`.
 
 ### 3.9 OPE (ADR-0008)
-- **FR-34** `ope.evaluate(log_path, candidate_static) -> {ips, dr, n, ess}` DEBE calcular IPS y DR sobre líneas `report` emparejadas con su `select`, usando la propensity registrada como $\mu$ y la política candidata reconstruida desde el `score` registrado y el bonus candidato sobre el $x_t$ registrado, conservando la penalización de cuota de cada brazo.
+- **FR-34** `ope.evaluate(log_path, candidate_static) -> {ips, dr, n, ess}` DEBE calcular IPS y DR sobre líneas `report` emparejadas con su `select`, usando la propensity registrada como $\mu$ y la política candidata reconstruida desde el `score` registrado y el bonus candidato sobre el $x_t$ registrado, conservando la penalización de cuota de cada brazo. El bonus candidato DEBE reconstruirse como `candidate_static.alpha · radius` a partir del `radius` persistido (nunca reescalando el `bonus` registrado por el cociente de `alpha`s, que es indefinido cuando el `alpha` registrado es 0). Los brazos activos para el softmax candidato DEBEN determinarse por la máscara `active` persistida, nunca por `policy > 0` (una política registrada puede hacer underflow a 0 en un brazo estructuralmente activo). El softmax DEBE restar el máximo `score` antes de dividir por `tau`, igual que el paso online (R4-SF-1).
 
 ---
 
@@ -215,7 +215,9 @@ report sobre inexistente → error -32002
  "arm_index":3,"arm_id":"gpt-5-codex@openai-codex","propensity":0.8123,
  "x":[1.0,0.54,...],                       // 32 floats
  "policy":[0.01,0.8123,...],               // 32 floats (0 en enmascarados)
- "score":[...],"exploit":[...],"bonus":[...],"shadow_price":[...],
+ "score":[...],"exploit":[...],"bonus":[...],
+ "radius":[...],"active":[true,true,...],           // radius sin escalar por alpha; active = máscara estructural (FR-08, FR-34)
+ "shadow_price":[...],
   "utilization":{"gpt-5-codex@openai-codex":[0.42,0.10]},
   "est_units":2.1,"ledger_event_id":42,"featurizer_version":1,
   "selection_sequence":81,"rng_key":[123,456]}
