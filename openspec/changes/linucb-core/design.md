@@ -73,23 +73,24 @@ Convoy aporta `task_kind`, conteos, flags y `priority`; el router no inspecciona
 ### D17 — Configuración TOML por `--config`; cambio = reinicio (ADR-0017)
 `tomllib` (stdlib); `Config` frozen; `ConfigError(field, reason)` con ruta de campo. Sin hot-reload ni añadir brazos en caliente (F11). Cambio de `arm_ids` ⇒ snapshot incompatible ⇒ decisión explícita del operador.
 
-### D18 — `jax_enable_x64` en `__init__` y dtypes explícitos (ADR-0018)
-`__init__.py` activa x64 antes de cualquier `import jax.numpy` en submódulos; `types.py` fija `F64/F32/I32/U32`; `init_state` construye con esos dtypes; test verifica `A.dtype == float64`. Solo `linucb.py`, `state.py` (y `types.py` para dtypes) importan `jax`; el resto es Python + NumPy y se testea sin compilar.
+### D18 — `jax_enable_x64` por módulo consumidor y dtypes explícitos (ADR-0018, JAX-1)
+`domain.py` contiene todos los tipos JAX-free (`TaskKind`, `Priority`, `RoutingRequest`, `StaticConfig`, `Pending`, `SnapshotMeta`, `MAX_INT31`); `types.py` los reimporta para conveniencia de los módulos JAX y añade `F64/F32/I32/U32` y los NamedTuples JAX (`BanditState`, `QuotaView`, `Diagnostics`). `__init__.py` NO activa x64 ni importa jax: expone `select`/`update`/`QuotaLedger`/`snapshot`/`restore`/`BanditState`/`StaticConfig` de forma perezosa vía `__getattr__` (PEP 562), de modo que `import azuma_router` o cualquiera de sus submódulos —crucialmente `azuma_router.ope`, que FR-34 prohíbe que cargue `jax`— no importa jax. Cada uno de los tres módulos que sí construyen arrays (`types.py`, `linucb.py`, `state.py`) activa x64 en su propia cabecera, justo antes de su propio `import jax.numpy`, para que el interruptor quede activo sin importar cuál de los tres se cargue primero. `init_state` construye con esos dtypes; test verifica `A.dtype == float64` (tocando el export perezoso `select`, no solo importando el paquete). Solo `linucb.py`, `state.py` y `types.py` importan `jax`; el resto (incluido `domain.py`, `wal.py`, `config.py`, `featurizer.py`, `ope.py`) es Python + NumPy y se testea sin compilar; un test de subproceso fresco verifica que `import azuma_router.ope` deja `jax`/`jaxlib` fuera de `sys.modules`.
 
 ## Module layout
 
 ```
 src/azuma_router/
-  __init__.py   # x64 + __all__ (D12, D18)         wal.py       # DecisionLog + PendingStore (D11, D14)
+  __init__.py   # exports perezosos (D12, D18)     wal.py       # DecisionLog + PendingStore (D11, D14)
   errors.py     # AzumaError y derivadas           snapshot.py  # snapshot / restore (D9)
-  types.py      # enums, dataclasses, NamedTuples  ope.py       # IPS / DR en NumPy
-  config.py     # load_config, to_static_config    daemon.py    # Router + serve + __main__ (D10)
-  featurizer.py # featurize, FEATURIZER_VERSION    state.py     # init_state
-  linucb.py     # select / update + *_jit          quota.py     # ventanas, ledger, log_barrier, est_units
+  domain.py     # tipos JAX-free (D18, JAX-1)      ope.py       # IPS / DR en NumPy, JAX-free (D18, JAX-1)
+  types.py      # domain.py + dtypes + NamedTuples daemon.py    # Router + serve + __main__ (D10)
+  config.py     # load_config, to_static_config    state.py     # init_state
+  featurizer.py # featurize, FEATURIZER_VERSION    quota.py     # ventanas, ledger, log_barrier, est_units
+  linucb.py     # select / update + *_jit
   reward.py     # compute_reward
 ```
 
-Dependencias solo hacia abajo: `daemon → {wal, snapshot, quota, reward, featurizer, linucb, state, config}`; `ope → wal`; `snapshot → {types, quota}`; `linucb, state → types`; `config → {types, errors}`; `types → jax.numpy` (dtypes).
+Dependencias solo hacia abajo: `daemon → {wal, snapshot, quota, reward, featurizer, linucb, state, config}`; `ope → wal → {config, domain, featurizer}` (sin arista hacia `types`/`state`/`linucb`, JAX-free de extremo a extremo); `snapshot → {types, quota}`; `linucb, state → types`; `config, featurizer → domain`; `types → domain` + `jax.numpy` (dtypes); `__init__` → ninguno de forma eager (resuelve `linucb`/`quota`/`snapshot`/`types`/`domain` bajo demanda vía `__getattr__`).
 
 ## Sequences
 

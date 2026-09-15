@@ -405,13 +405,16 @@ def test_ope_no_jax_import() -> None:
 def test_ope_does_not_pull_jax_into_a_fresh_interpreter() -> None:
     """JAX-1: the AST check above only sees ope.py's own `import` statements, so it cannot
     catch jax loaded transitively through the package `__init__` or a shared type module
-    (FR-34: OPE MUST NOT import jax, not merely avoid an `import jax` line of its own)."""
+    (FR-34: OPE MUST NOT import jax, not merely avoid an `import jax` line of its own).
+    Checks both `jax` and `jaxlib`: a future edge that reaches `jaxlib` directly without
+    going through the `jax` package name would otherwise escape this regression test."""
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             "import sys; import azuma_router.ope; "
-            "assert 'jax' not in sys.modules, sorted(sys.modules)",
+            "assert 'jax' not in sys.modules, sorted(sys.modules); "
+            "assert 'jaxlib' not in sys.modules, sorted(sys.modules)",
         ],
         capture_output=True,
         text=True,
