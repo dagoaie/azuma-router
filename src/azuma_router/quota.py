@@ -173,12 +173,51 @@ class QuotaLedger:
 
     @classmethod
     def load(cls, data: dict[str, Any], config: Config) -> "QuotaLedger":
-        """Restores QuotaLedger state from snapshot dump data."""
+        """Restores one canonical, domain-valid ledger dump from snapshot metadata."""
+        expected_arm_ids = {arm.arm_id for arm in config.arms}
+        if set(data) != {"next_event_id", "events"}:
+            raise ValueError("ledger must contain exactly next_event_id and events")
+        next_event_id = data["next_event_id"]
+        if type(next_event_id) is not int or next_event_id < 1:
+            raise ValueError("ledger next_event_id must be a positive integer")
+        events = data["events"]
+        if not isinstance(events, dict) or set(events) != expected_arm_ids:
+            raise ValueError("ledger events must contain exactly the configured arm IDs")
+
         ledger = cls(config)
-        for ev_list in data["events"].values():
+        seen_event_ids: set[int] = set()
+        for arm_id in (arm.arm_id for arm in config.arms):
+            ev_list = events[arm_id]
+            if not isinstance(ev_list, list):
+                raise ValueError(f"ledger events for {arm_id} must be a list")
             for item in ev_list:
-                ledger.record(
-                    int(item["event_id"]), item["arm_id"], float(item["units"]), float(item["ts"])
-                )
-        ledger._next_event_id = max(ledger._next_event_id, int(data["next_event_id"]))
+                if not isinstance(item, dict) or set(item) != {"event_id", "arm_id", "units", "ts"}:
+                    raise ValueError(f"ledger event for {arm_id} has an invalid schema")
+                event_id = item["event_id"]
+                event_arm_id = item["arm_id"]
+                units = item["units"]
+                timestamp = item["ts"]
+                if type(event_id) is not int or event_id < 1 or event_id in seen_event_ids:
+                    raise ValueError("ledger event_id must be a unique positive integer")
+                if event_arm_id != arm_id:
+                    raise ValueError("ledger event arm_id must match its arm collection")
+                if (
+                    isinstance(units, bool)
+                    or not isinstance(units, int | float)
+                    or not math.isfinite(units)
+                    or units < 0
+                ):
+                    raise ValueError("ledger event units must be finite and non-negative")
+                if (
+                    isinstance(timestamp, bool)
+                    or not isinstance(timestamp, int | float)
+                    or not math.isfinite(timestamp)
+                    or timestamp < 0
+                ):
+                    raise ValueError("ledger event ts must be finite and non-negative")
+                seen_event_ids.add(event_id)
+                ledger.record(event_id, arm_id, float(units), float(timestamp))
+        if next_event_id <= max(seen_event_ids, default=0):
+            raise ValueError("ledger next_event_id must exceed every recorded event_id")
+        ledger._next_event_id = next_event_id
         return ledger

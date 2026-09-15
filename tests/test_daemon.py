@@ -4,6 +4,7 @@ import importlib
 import io
 import json
 import math
+import os
 import shutil
 import signal
 import sys
@@ -808,6 +809,116 @@ def _boot_exit_code(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> tuple
         router.boot()
     events = [json.loads(line)["event"] for line in capsys.readouterr().err.splitlines()]
     return int(exit_info.value.code or 0), events
+
+
+def _journal_with_one_reported_decision(tmp_path: Path) -> Path:
+    router = _booted_router(tmp_path)
+    d_id = router.select({"request": REQUEST})["decision_id"]
+    router.report(_report_params(d_id))
+    assert router.dlog is not None
+    router.dlog.close()  # crash: no shutdown snapshot, so boot replays the whole journal
+    return tmp_path / "decisions.jsonl"
+
+
+def _rewrite_journal(journal: Path, mutate: Callable[[list[dict[str, Any]]], None]) -> None:
+    entries = [json.loads(line) for line in journal.read_text().splitlines()]
+    mutate(entries)
+    journal.write_text("".join(json.dumps(entry) + "\n" for entry in entries))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda e: e[0].pop("decision_id"), id="select-missing-decision-id"),
+        pytest.param(lambda e: e[0].__setitem__("x", e[0]["x"][:-1]), id="select-x-wrong-dim"),
+        pytest.param(lambda e: e[0].__setitem__("x", [float("nan")] * 32), id="select-x-nan"),
+        pytest.param(lambda e: e[0].__setitem__("arm_index", 1), id="select-arm-index-mismatch"),
+        pytest.param(lambda e: e[0].__setitem__("arm_index", 99), id="select-arm-index-range"),
+        pytest.param(lambda e: e[0].__setitem__("propensity", 0.0), id="select-propensity-zero"),
+        pytest.param(lambda e: e[0].__setitem__("est_units", "2"), id="select-est-units-str"),
+        pytest.param(lambda e: e[0].__setitem__("est_units", 10**1000), id="select-est-units-huge"),
+        pytest.param(lambda e: e[0].__setitem__("policy", [float("nan")]), id="select-policy-nan"),
+        pytest.param(
+            lambda e: e[0].__setitem__("featurizer_version", 2), id="select-wrong-featurizer"
+        ),
+        pytest.param(lambda e: e[0].__setitem__("extra", 1), id="select-extra-field"),
+        pytest.param(lambda e: e[1].__setitem__("reward", 1.5), id="report-reward-out-of-range"),
+        pytest.param(lambda e: e[1].__setitem__("reward", float("inf")), id="report-reward-inf"),
+        pytest.param(lambda e: e[1].__setitem__("actual_units", -1.0), id="report-units-negative"),
+        pytest.param(lambda e: e[1].__setitem__("state_version", "1"), id="report-version-str"),
+        pytest.param(lambda e: e.append(e[1].copy()), id="report-duplicate"),
+        pytest.param(lambda e: e.append(e[0].copy()), id="select-duplicate-in-active-segment"),
+        pytest.param(
+            lambda e: e.append({**e[0], "est_units": e[0]["est_units"] + 1.0}),
+            id="select-conflicts-with-carried-duplicate",
+        ),
+        pytest.param(
+            lambda e: e.append(
+                {
+                    **e[0],
+                    "decision_id": "018f6c2e-0000-7000-8000-000000000002",
+                    "selection_sequence": 2,
+                    "rng_key": [3, 4],
+                }
+            ),
+            id="select-reuses-snapshot-ledger-event",
+        ),
+        pytest.param(
+            lambda e: e.append({"phase": "expire", "decision_id": "ghost", "ts_select": 0.0}),
+            id="expire-orphan",
+        ),
+    ],
+)
+def test_boot_exits_3_on_a_semantically_corrupt_journal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    mutate: Callable[[list[dict[str, Any]]], None],
+) -> None:
+    """A journal line that parses but is not a valid decision record is replay_failed, never a
+    traceback and never an update fed with garbage (RR8-2)."""
+    journal = _journal_with_one_reported_decision(tmp_path)
+    _rewrite_journal(journal, mutate)
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "replay_failed" in events
+
+
+def test_boot_exits_3_on_recursively_nested_journal_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Decoder recursion is journal corruption, not an unstructured startup exception (RR8-2)."""
+    nested = "[" * 2000 + "0" + "]" * 2000
+    (tmp_path / "decisions.jsonl").write_text(f'{{"phase":{nested}}}\n', encoding="utf-8")
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "replay_failed" in events
+
+
+def test_fresh_boot_creates_the_state_directory_private_under_a_permissive_umask(
+    tmp_path: Path,
+) -> None:
+    """Default layout: the WAL lives inside the state dir, which must be 0700 from the first
+    boot, before any snapshot has been written (RR8-1)."""
+    state_dir = tmp_path / ".azuma"
+    router = Router(
+        config=load_config(Path("fixtures/config/azuma.valid.toml")),
+        snapshot_dir=state_dir,
+        decision_log_path=state_dir / "decisions.jsonl",
+    )
+    previous_umask = os.umask(0o000)
+    try:
+        router.boot()
+    finally:
+        os.umask(previous_umask)
+
+    assert state_dir.stat().st_mode & 0o777 == 0o700
+    assert (state_dir / "decisions.jsonl").stat().st_mode & 0o777 == 0o600
+    assert not (state_dir / "snapshot").exists()
+    router.close(with_snapshot=False)
 
 
 def test_boot_refuses_learned_updates_in_the_rotated_wal_without_a_snapshot(

@@ -45,9 +45,13 @@ def test_replay_reported_ac20() -> None:
     assert "018f6c2e-0000-7000-8000-000000000001" in applied_ids
 
 
-def test_replay_corrupt_tail() -> None:
+def test_replay_corrupt_tail(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
-    wal_path = Path("fixtures/wal/corrupt_tail.jsonl")
+    wal_path = tmp_path / "corrupt_tail.jsonl"
+    valid_select = Path("fixtures/wal/pending_only.jsonl").read_text(encoding="utf-8")
+    wal_path.write_text(
+        valid_select + '{"phase":"select","decision_id":"truncated"', encoding="utf-8"
+    )
 
     pending_store, _, _, _rng_key, _selection_sequence = replay_log(
         active_path=wal_path,
@@ -61,9 +65,46 @@ def test_replay_corrupt_tail() -> None:
     assert len(pending_store) == 1
 
 
-def test_replay_corrupt_middle() -> None:
+def test_replay_rejects_a_complete_corrupt_final_line(tmp_path: Path) -> None:
+    """Only an unterminated final line can be a crash truncation artefact (FR-23)."""
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
-    wal_path = Path("fixtures/wal/corrupt_middle.jsonl")
+    wal_path = tmp_path / "complete_corrupt_tail.jsonl"
+    wal_path.write_text('{"phase":\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="WAL corrupt"):
+        replay_log(
+            active_path=wal_path,
+            rotated_path=None,
+            snapshot_state_version=0,
+            snapshot_selection_sequence=0,
+            config=cfg,
+        )
+
+
+def test_replay_rejects_a_second_active_carried_select(tmp_path: Path) -> None:
+    """Rotation emits one carried copy per live decision, never an unbounded duplicate stream."""
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    entry = json.loads(Path("fixtures/wal/pending_only.jsonl").read_text(encoding="utf-8"))
+    rotated_path = tmp_path / "decisions.1.jsonl"
+    active_path = tmp_path / "decisions.jsonl"
+    rotated_path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    active_path.write_text(json.dumps(entry) + "\n" + json.dumps(entry) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="conflicts"):
+        replay_log(
+            active_path=active_path,
+            rotated_path=rotated_path,
+            snapshot_state_version=0,
+            snapshot_selection_sequence=1,
+            config=cfg,
+        )
+
+
+def test_replay_corrupt_middle(tmp_path: Path) -> None:
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    wal_path = tmp_path / "corrupt_middle.jsonl"
+    valid_select = Path("fixtures/wal/pending_only.jsonl").read_text(encoding="utf-8")
+    wal_path.write_text(valid_select + '{"phase":\n' + valid_select, encoding="utf-8")
 
     with pytest.raises(ValueError) as exc_info:
         replay_log(
@@ -79,28 +120,12 @@ def test_replay_corrupt_middle() -> None:
 def test_replay_select_missing_ledger_event_id_raises(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     wal_path = tmp_path / "missing_eid.jsonl"
-    line = {
-        "phase": "select",
-        "decision_id": "018f6c2e-0000-7000-8000-000000000001",
-        "ts": 1757800000.0,
-        "state_version": 0,
-        "arm_index": 0,
-        "arm_id": "gpt-5-codex@openai-codex",
-        "propensity": 0.8123,
-        "x": [1.0] * 32,
-        "policy": [0.8123] + [0.0] * 31,
-        "score": [0.71] + [-1e9] * 31,
-        "exploit": [0.5] + [0.0] * 31,
-        "bonus": [0.21] + [0.0] * 31,
-        "shadow_price": [0.0] * 32,
-        "utilization": {"gpt-5-codex@openai-codex": [0.0, 0.0]},
-        "est_units": 1.0,
-        "featurizer_version": 1,
-    }
+    line = json.loads(Path("fixtures/wal/pending_only.jsonl").read_text(encoding="utf-8"))
     # Notice no ledger_event_id in line!
+    line.pop("ledger_event_id")
     wal_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="ledger_event_id"):
+    with pytest.raises(ValueError, match="invalid schema"):
         replay_log(
             active_path=wal_path,
             rotated_path=None,

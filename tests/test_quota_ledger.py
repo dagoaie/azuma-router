@@ -1,8 +1,11 @@
 """Tests for QuotaLedger and windowing calculations (T12 & T13)."""
 
+import copy
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -155,3 +158,43 @@ def test_load_restores_event_ids_and_allocator() -> None:
     restored = QuotaLedger.load(ledger.dump(), _ledger().config)
     assert restored.has_event(1) and restored.has_event(2)
     assert restored.next_event_id() == 3
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda dump: dump["events"].__setitem__("unknown", []), id="unknown-arm"
+        ),
+        pytest.param(
+            lambda dump: dump.__setitem__("next_event_id", 1), id="allocator-not-after-events"
+        ),
+        pytest.param(
+            lambda dump: dump["events"][CODEX][0].__setitem__("units", -1.0),
+            id="negative-units",
+        ),
+        pytest.param(
+            lambda dump: dump["events"][CODEX][0].__setitem__("ts", float("nan")),
+            id="non-finite-timestamp",
+        ),
+        pytest.param(
+            lambda dump: dump["events"][CODEX][0].__setitem__("event_id", True),
+            id="boolean-event-id",
+        ),
+        pytest.param(
+            lambda dump: dump["events"][CODEX][0].__setitem__("arm_id", "qwen3-coder@openrouter"),
+            id="arm-does-not-match-collection",
+        ),
+    ],
+)
+def test_load_rejects_invalid_persisted_ledger_domain_state(
+    mutate: Callable[[dict[str, Any]], None],
+) -> None:
+    """A decodable ledger must still satisfy snapshot domain invariants (RR8-3)."""
+    ledger = _ledger()
+    ledger.record(ledger.next_event_id(), CODEX, 1.0, 1000.0)
+    dump = copy.deepcopy(ledger.dump())
+    mutate(dump)
+
+    with pytest.raises(ValueError):
+        QuotaLedger.load(dump, ledger.config)
