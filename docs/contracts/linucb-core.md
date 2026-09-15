@@ -26,7 +26,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 
 ### 3.1 Configuración (ADR-0012, 0017)
 - **FR-01** Dado un `azuma.toml` válido, `load_config(path)` DEBE devolver un `Config` inmutable con brazos indexados por orden de aparición.
-- **FR-02** Dado un TOML con `arm_id` duplicado, sección obligatoria ausente, tipo incorrecto, `billing_mode = "subscription"` sin ventanas, o `billing_mode = "per_token"` con ventanas o `barrier_mu > 0`, DEBE lanzar `ConfigError` con la ruta del campo (`arms[2].windows[0].capacity`).
+- **FR-02** Dado un TOML con `arm_id` duplicado, sección obligatoria ausente, tipo incorrecto, valor numérico no finito o con `|v| > 2³¹ − 1` (fuera del rango seguro en float32), `billing_mode = "subscription"` sin ventanas, o `billing_mode = "per_token"` con ventanas o `barrier_mu > 0`, DEBE lanzar `ConfigError` con la ruta del campo (`arms[2].windows[0].capacity`).
 - **FR-03** `K = len(arms)` DEBE cumplir `1 ≤ K ≤ K_max`; `W = max(len(arm.windows))` DEBE cumplir `W ≤ W_max`.
 
 ### 3.2 Featurizer (ADR-0003, 0004, 0015)
@@ -36,7 +36,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 
 ### 3.3 Bandido (ADR-0001, 0002, 0008)
 - **FR-07** `init_state(config) -> BanditState` DEBE devolver `A[a] = ridge_lambda · I` para todo `a`, `b = 0`, `n_pulls = 0`, `mask[a] = True` para `a < K` y `False` para el padding, `rng_key = PRNGKey(seed)`.
-- **FR-08** `select(state, x, quota_view, static) -> (state', arm, propensity, diagnostics)` DEBE calcular por brazo `exploit = x·θ̂`, `bonus = alpha·sqrt(x·A⁻¹x)`, `shadow = max_W −μ_a·ln(1−u)`, `score = exploit + bonus − shadow·est_units`, enmascarar con `−inf`, y muestrear con $\pi = (1-\varepsilon)\,\mathrm{softmax}(\text{score}/\tau) + \varepsilon/K_{act}$.
+- **FR-08** `select(state, x, quota_view, static) -> (state', arm, propensity, diagnostics)` DEBE calcular por brazo `radius = sqrt(x·A⁻¹x)`, `exploit = x·θ̂`, `bonus = alpha·radius`, `shadow = max_W −μ_a·ln(1−u)`, `score = exploit + bonus − shadow·est_units`, enmascarar con `−inf`, y muestrear con $\pi = (1-\varepsilon)\,\mathrm{softmax}(\text{score}/\tau) + \varepsilon/K_{act}$. `diagnostics` DEBE incluir tanto `radius` (sin escalar por `alpha`) como `active` (máscara estructural: mask ∧ allowed ∧ ¬exhausted) además de `bonus`, para que el journal (§4.4) persista ambos y `ope.evaluate` (FR-34) pueda reconstruir el bonus de un candidato con otro `alpha`, incluido `alpha = 0`.
 - **FR-09** `select` DEBE ser una función pura: mismo `(state, x, quota_view)` ⇒ misma salida bitwise. `state'.rng_key` DEBE diferir de `state.rng_key`; todo lo demás igual.
 - **FR-10** Si `quota_view.mask_override` (derivado de `allowed_arms`) y la máscara del estado dejan 0 brazos activos, `select` DEBE señalar `no_arm_available = True` en `diagnostics` y el daemon DEBE responder `-32004`.
 - **FR-11** `update(state, x, arm, reward, static) -> state'` DEBE producir `A'[arm] = A[arm] + x xᵀ`, `b'[arm] = b[arm] + reward·x`, `n_pulls'[arm] += 1`, y dejar los demás brazos bitwise iguales.
@@ -46,6 +46,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 ### 3.4 Cuota y precio sombra (ADR-0005, 0006, 0011)
 - **FR-14** `QuotaLedger.record(arm_id, units, ts)` y `QuotaLedger.utilization(now) -> f32[K_max, W_max]` DEBEN dar `u = consumido_en_ventana / capacity`, con `RollingWindow` (últimos `duration_s`) y `FixedResetWindow` (desde el último `reset_anchor`).
 - **FR-15** `u ≥ 1.0` en cualquier ventana ⇒ el brazo DEBE quedar enmascarado en la `QuotaView` de ese `select`.
+- **FR-15b** El ledger DEBE retener cada evento al menos `max(duración de la ventana más larga del brazo, pending_ttl_s)` (para brazos `per_token`, sin ventanas: `pending_ttl_s`) y podar los más antiguos en cada `utilization` para todo brazo, para que `correct` en `report` siempre encuentre su `ledger_event_id`; un `report` cuyo evento no existe es una violación de invariante ⇒ `ledger_integrity_error`, salida código 4 **antes** de escribir la línea `report`.
 - **FR-16** El consumo estimado (`est_units = units_per_request + units_per_1k_tokens·(input_tokens + expected_output_tokens)/1000`) DEBE anotarse en `select`; `report` DEBE reemplazarlo por el consumo real (`actual_*_tokens`) en el mismo evento del ledger (no sumar un segundo).
 - **FR-17** Brazos `per_token` DEBEN tener `shadow = 0` siempre.
 
@@ -55,16 +56,17 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 
 ### 3.6 WAL y PendingStore (ADR-0011, 0016)
 - **FR-20** Antes de responder a `select`, el daemon DEBE haber hecho `append + flush` de una línea `phase="select"` en el JSONL.
-- **FR-21** `report` para `decision_id` pendiente DEBE, en este orden: escribir `phase="report"`, corregir el ledger, aplicar `update`, mover a aplicado. Duplicado ⇒ `{"applied": false, "reason": "duplicate"}` sin escritura.
+- **FR-21** `report` para `decision_id` pendiente DEBE, en este orden: escribir `phase="report"`, corregir el ledger, aplicar `update`, mover a aplicado. Antes de publicar cualquier snapshot, el WAL DEBE hacer `flush + fsync`, para que un snapshot durable no pueda contener un `report` ausente del journal. Duplicado ⇒ `{"applied": false, "reason": "duplicate"}` sin escritura.
 - **FR-22** Pendientes con `now − ts_select > pending_ttl_s` DEBEN expirar en el barrido (inicio de `select` y `snapshot`): línea `phase="expire"`, sin `update`, consumo estimado del ledger se mantiene.
-- **FR-23** Al arrancar, el daemon DEBE reconstruir `PendingStore` por replay del JSONL (fichero activo + anterior rotado) considerando solo líneas con `state_version ≥ snapshot.state_version`.
+- **FR-23** Al arrancar, el daemon DEBE reconstruir `PendingStore` por replay del JSONL (fichero activo + anterior rotado): **toda** línea `select` retenida sin `report`/`expire` posterior es un pendiente vivo, sea cual sea su `state_version` (los `select` no lo avanzan); el ledger se reconstruye de forma idempotente por `ledger_event_id` (evento ya presente en el snapshot ⇒ no se re-registra). Cada `select` persiste su `selection_sequence` y la `rng_key` posterior; el replay restaura la última transición estrictamente posterior a `SnapshotMeta.selection_sequence`, que DEBE ser contigua. El filtro `state_version > snapshot.state_version` aplica solo a la reaplicación de líneas `report` (FR-24), pero un `report` emparejado con un `select` posterior al snapshot DEBE tener también una versión posterior; de lo contrario es corrupción. Cada línea se valida contra su esquema antes de mutar estado (tipos, finitud, `x` de dimensión `d`, `arm_index` ligado a `arm_id` de la config, `propensity ∈ (0, 1]`, `reward ∈ [0, 1]`, unidades `≥ 0`, `NaN`/`Infinity` rechazados), y un `select` duplicado solo es válido si es la copia idéntica arrastrada por rotación; una segunda fase terminal para la misma decisión es corrupción. Un `report`/`expire` sin `select`, una transición PRNG ausente/discontinua o cualquier campo inválido ⇒ journal corrupto ⇒ `replay_failed`, salida código 3 (nunca una traza).
+  Para un `select` posterior al snapshot, `state_version` DEBE ser igual a la versión del snapshot más los `report` posteriores ya encontrados; cualquier discrepancia es corrupción.
 - **FR-24** `report` de `decision_id` desconocido ⇒ `-32002`; expirado ⇒ `-32003`.
 
 ### 3.7 Snapshot (ADR-0009, 0017)
-- **FR-25** `snapshot(state, ledger, meta, dir)` DEBE escribir `state.safetensors` + `state.json` en `<dir>/snapshot.tmp/`, `fsync` ambos, `fsync` del directorio, y `rename` a `<dir>/snapshot/` (reemplazando el anterior de forma atómica).
-- **FR-26** `restore(dir, config) -> (state, ledger, meta)` DEBE lanzar `IncompatibleSnapshotError` si difiere cualquiera de: `schema_version`, `d`, `K_max`, `W_max`, `featurizer_version`, `arm_ids`. Nunca migrar.
+- **FR-25** `snapshot(state, ledger, meta, dir)` DEBE escribir `state.safetensors` + `state.json` en `<dir>/snapshot.tmp/`, `fsync` ambos, `fsync` del directorio, `rename` a `<dir>/snapshot/` (reemplazando el anterior de forma atómica) y `fsync` del directorio padre antes de borrar `snapshot.old/`. El directorio de estado se crea con modo `0700` desde el primer arranque (también cuando lo crea el WAL antes de cualquier snapshot, con independencia del `umask`; un directorio padre preexistente, externo a la configuración, no se modifica) y los ficheros persistidos (WAL, tensores, metadata) con `0600`; `restore` nunca altera permisos, y un fichero ilegible sigue siendo `snapshot_read_failed`. Cualquier excepción en cualquier paso (`OSError`, safetensors, serialización) ⇒ `snapshot_write_error`, salida código 4; nunca un `-32603` que deje al daemon sirviendo sin snapshots. `config_sha256` = SHA-256 del JSON canónico del `Config` validado completo.
+- **FR-26** `restore(dir, config) -> (state, ledger, meta)` DEBE lanzar `IncompatibleSnapshotError` si difiere cualquiera de: `schema_version`, `d`, `K_max`, `W_max`, `featurizer_version`, `arm_ids`; o si el conjunto, forma, dtype, finitud, simetría/SPD de `A`, contadores, máscara canónica o forma de `rng_key` no son válidos, si `selection_sequence < state_version` (cada `update` sigue a un `select`), o si el ledger no tiene esquema canónico, brazos configurados exactos, ids positivos únicos y allocator coherente, o unidades/timestamps finitos no negativos. Nunca migrar.
 - **FR-27** `restore(snapshot(s)) == s` bitwise para todos los arrays.
-- **FR-28** El daemon DEBE hacer snapshot cuando `updates_since_snapshot ≥ 100` **o** `now − last_snapshot ≥ 30 s` (evaluado tras cada `report`) y en shutdown limpio (EOF en stdin o SIGTERM).
+- **FR-28** El daemon DEBE hacer snapshot cuando `updates_since_snapshot ≥ 100` **o** `now − last_snapshot ≥ 30 s` (evaluado tras cada `report`) y en shutdown limpio (EOF en stdin o SIGTERM/SIGINT). Una señal recibida mientras una petición está en curso se **difiere** hasta que esa petición ha respondido (`shutdown_deferred`); nunca se hace snapshot a mitad de un `report`.
 
 ### 3.8 Daemon JSON-RPC (ADR-0010, 0013, 0014)
 - **FR-29** El daemon lee líneas de `stdin`, una petición JSON-RPC 2.0 por línea, y escribe una respuesta por línea en `stdout`; `stderr` solo logs JSON estructurados.
@@ -74,7 +76,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 - **FR-33** Batch JSON-RPC (array) NO se soporta ⇒ `-32600`.
 
 ### 3.9 OPE (ADR-0008)
-- **FR-34** `ope.evaluate(log_path, candidate_static) -> {ips, dr, n, ess}` DEBE calcular IPS y DR sobre líneas `report` emparejadas con su `select`, usando la propensity registrada como $\mu$ y la política candidata evaluada sobre el $x_t$ registrado.
+- **FR-34** `ope.evaluate(log_path, candidate_static) -> {ips, dr, n, ess}` DEBE calcular IPS y DR sobre líneas `report` emparejadas con su `select`, usando la propensity registrada como $\mu$ y la política candidata reconstruida desde el `score` registrado y el bonus candidato sobre el $x_t$ registrado, conservando la penalización de cuota de cada brazo. El bonus candidato DEBE reconstruirse como `candidate_static.alpha · radius` a partir del `radius` persistido (nunca reescalando el `bonus` registrado por el cociente de `alpha`s, que es indefinido cuando el `alpha` registrado es 0). Los brazos activos para el softmax candidato DEBEN determinarse por la máscara `active` persistida, nunca por `policy > 0` (una política registrada puede hacer underflow a 0 en un brazo estructuralmente activo). El softmax DEBE restar el máximo `score` antes de dividir por `tau`, igual que el paso online (R4-SF-1). `evaluate` DEBE leer el segmento rotado retenido (`decisions.1.jsonl`, §4.4) antes del activo, igual que `wal.replay_log`, contando exactamente una vez un `select` reenviado byte-idéntico al segmento activo tras la rotación. La decodificación DEBE ser estricta (compartida o replicada de `wal.py`): rechaza `NaN`/`Infinity` y cualquier línea malformada salvo la última cuando es un truncamiento de crash (FR-24) — nunca un `except Exception: continue` genérico. `ope.py` y su cadena de imports (`wal.py`, `config.py`, `featurizer.py`, y los tipos JAX-free en `azuma_router.domain`) NO DEBEN importar `jax`, ni siquiera transitivamente a través de `azuma_router/__init__.py`; el paquete expone sus símbolos JAX de forma perezosa (PEP 562) precisamente para que `import azuma_router.ope` no lo cargue (JAX-1).
 
 ---
 
@@ -92,7 +94,7 @@ w_max             = 4                   # int, 1..8; forma estática
 d                 = 32                  # int, DEBE ser 32 en featurizer v1
 ridge_lambda      = 1.0                 # float > 0
 alpha             = 1.0                 # float ≥ 0
-tau               = 0.05                # float > 0
+tau               = 0.05                # float ≥ 1e-6 (temperatura; por debajo el softmax degenera en float64)
 epsilon_floor     = 0.02                # float en [0, 0.5]
 w_quality         = 1.0                 # float ≥ 0
 w_cost            = 0.3                 # float ≥ 0
@@ -119,7 +121,7 @@ barrier_mu        = 0.5                 # float ≥ 0; DEBE ser 0 si per_token
   [[arms.windows]]                      # 1..w_max entradas; obligatorio si subscription, prohibido si per_token
   kind        = "rolling"               # "rolling" | "fixed_reset"
   duration_s  = 18000                   # int > 0; solo rolling (5 h)
-  capacity    = 300.0                   # float > 0, en units
+  capacity    = 300.0                   # float > 0 y ≤ 2³¹ − 1 (FR-02), en units
 
   [[arms.windows]]
   kind         = "fixed_reset"
@@ -174,11 +176,12 @@ RoutingRequest (frozen dataclass)             # ADR-0013
 
 Pending (frozen dataclass)                    # ADR-0016
   decision_id: str (UUIDv7), arm_index: int, x: f64[32], propensity: float,
-  ts_select: float, est_units: float, ledger_event_id: int, state_version: int
+  ts_select: float, est_units: float, ledger_event_id: int, state_version: int,
+  select_entry: dict          # línea `select` del journal, arrastrada íntegra en la rotación del WAL
 
 SnapshotMeta (frozen dataclass)               # ADR-0009
-  schema_version: int (=1), state_version: int, featurizer_version: int (=1),
-  arm_ids: list[str], static: StaticConfig, seed: int, created_at: str (RFC 3339),
+  schema_version: int (=2), state_version: int, featurizer_version: int (=1),
+  arm_ids: list[str], static: StaticConfig, seed: int, selection_sequence: int, created_at: str (RFC 3339),
   ledger: LedgerDump, config_sha256: str
 ```
 
@@ -212,9 +215,12 @@ report sobre inexistente → error -32002
  "arm_index":3,"arm_id":"gpt-5-codex@openai-codex","propensity":0.8123,
  "x":[1.0,0.54,...],                       // 32 floats
  "policy":[0.01,0.8123,...],               // 32 floats (0 en enmascarados)
- "score":[...],"exploit":[...],"bonus":[...],"shadow_price":[...],
- "utilization":{"gpt-5-codex@openai-codex":[0.42,0.10]},
- "est_units":2.1,"featurizer_version":1}
+ "score":[...],"exploit":[...],"bonus":[...],
+ "radius":[...],"active":[true,true,...],           // radius sin escalar por alpha; active = máscara estructural (FR-08, FR-34)
+ "shadow_price":[...],
+  "utilization":{"gpt-5-codex@openai-codex":[0.42,0.10]},
+  "est_units":2.1,"ledger_event_id":42,"featurizer_version":1,
+  "selection_sequence":81,"rng_key":[123,456]}
 
 // phase = "report"
 {"phase":"report","decision_id":"018f...","ts":1757800012.9,"state_version":42,
@@ -253,7 +259,7 @@ Framing: UTF-8, un objeto JSON por línea terminada en `\n`, sin `Content-Length
   "decision_id":"018f6c2e-...",
   "arm":{"arm_id":"gpt-5-codex@openai-codex","model_id":"gpt-5-codex","provider":"openai-codex","billing_mode":"subscription"},
   "propensity":0.8123,
-  "diagnostics":{                                 // ausente si verbose=false
+  "diagnostics":{                                 // ausente si verbose=false; score, exploit, bonus, shadow_price de brazos enmascarados son null
     "score":{"gpt-5-codex@openai-codex":0.71,"qwen3-coder@openrouter":0.44},
     "exploit":{...},"bonus":{...},"shadow_price":{...},"policy":{...},
     "utilization":{"gpt-5-codex@openai-codex":{"rolling:18000":0.42,"fixed_reset:weekly":0.10}},
@@ -294,16 +300,16 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 
 | code | name | cuándo |
 |---|---|---|
-| −32700 | ParseError | línea no es JSON |
-| −32600 | InvalidRequest | falta `jsonrpc:"2.0"`/`method`, o batch |
+| −32700 | ParseError | línea no es JSON estricto (incluye `NaN`/`Infinity` y anidamiento más profundo que el decodificador); `id` siempre `null`; el bucle continúa |
+| −32600 | InvalidRequest | falta `jsonrpc:"2.0"`/`method`, batch, o `id` que no es string/entero/null (`data.reason = "invalid_id"`, se responde con `id: null`) |
 | −32601 | MethodNotFound | |
-| −32602 | InvalidParams | tipo/rango; `data.field` |
+| −32602 | InvalidParams | tipo/rango; `data.field`. Incluye `params` presente y no objeto (`data.field = "params"`, se responde con el `id` de la petición) |
 | −32001 | InvalidContext | featurizer rechaza; `data.field`, `data.reason` |
 | −32002 | UnknownDecision | |
 | −32003 | DecisionExpired | |
 | −32004 | NoArmAvailable | |
 | −32005 | NotReady | antes de `ready` |
-| −32006 | IncompatibleSnapshot | solo en arranque; el daemon escribe el error en stderr y sale con código 3 |
+| −32006 | IncompatibleSnapshot | solo en arranque; el daemon escribe `incompatible_snapshot` en stderr y sale con código 3 |
 
 ---
 
@@ -319,18 +325,26 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 | `input_tokens ≥ 10^6` | $x_1 = 1$ (clip). |
 | Línea stdin vacía | Ignorada silenciosamente. |
 | Línea > 1 MiB | `-32600`, `data.reason = "line_too_long"`. |
-| `id` ausente en `select`/`report` (notificación) | Se procesa pero no se responde (semántica JSON-RPC); se registra en stderr. |
+| `id` ausente en `select`/`report` (notificación) | Se procesa pero no se responde (semántica JSON-RPC); se registra en stderr. Un `"id": null` explícito **no** es notificación: se responde con `id: null`. |
 | `report` llega antes de que `select` haya hecho flush | Imposible: `select` responde solo tras flush (FR-20). |
 | Crash entre línea `select` y respuesta | Al arrancar, replay ve `select` sin `report`: pendiente; expirará o se reportará. |
-| Crash entre línea `report` y `update` aplicado | Replay reaplica `report` (línea existe, `state_version` del snapshot menor): `update` es idempotente por replay porque solo se reaplica si `state_version_line > snapshot.state_version`. |
+| Crash entre línea `report` y `update` aplicado | Replay reaplica `report` (línea existe, `state_version` del snapshot menor): `update` es idempotente por replay porque solo se reaplica si `state_version_line > snapshot.state_version`. Los `report` reaplicados DEBEN ser contiguos (`snapshot.state_version + 1, + 2, …`); un hueco ⇒ `replay_failed`, salida 3. |
+| Journal de un formato anterior (línea `select` sin `selection_sequence`/`rng_key`) o con registros semánticamente inválidos (campo ausente, tipo incorrecto, `NaN`, `x` de otra dimensión, `arm_index`/`arm_id` que no casan con la config, rangos fuera de dominio) | `replay_failed`, salida 3; nunca se migra ni se repara. Recuperación: borrar `snapshot/` y el journal para arrancar desde el estado inicial. |
+| Excepción inesperada tras escribir la línea `report` (`ledger.correct`, `update_jit`, `pending`) | La línea ya fue escrita y vaciada al sistema operativo: `journal_apply_error`, salida 4 **sin** snapshot; el replay al arrancar deja memoria y journal reconciliados. Frente a corte de energía, se sincroniza antes de publicar cualquier snapshot. |
 | Snapshot `.tmp` residual al arrancar | Se borra; se restaura `snapshot/` si existe. |
-| `snapshot/` ausente | Estado inicial (FR-07); `ready.restored_from_snapshot = false`; WAL existente se **rechaza** si contiene `state_version > 0` (inconsistencia) ⇒ salida código 3. |
+| `snapshot/` ausente | Estado inicial (FR-07); `ready.restored_from_snapshot = false`; un `decisions.1.jsonl` presente sin `snapshot/` es inconsistente (la rotación siempre sigue a un snapshot) ⇒ `wal_inconsistent`, salida código 3; un `decisions.jsonl` sin rotar se reproduce íntegro desde el estado inicial (caso: kill antes del primer snapshot de cadencia). |
 | `arm_ids` del snapshot ≠ config | `IncompatibleSnapshotError`, salida código 3, mensaje con el diff de listas. |
+| Snapshot o WAL ilegibles (permisos, E/S) en arranque | `snapshot_read_failed` / `replay_failed` en stderr, salida código 3; nunca un traceback. Un `azuma.toml` ilegible ⇒ `config_error` (`file`), salida 3. |
+| Snapshot con tensores o ledger que no decodifican o violan sus invariantes de dominio (tras pasar versión y formas) | `incompatible_snapshot`, salida código 3. |
 | `config_sha256` ≠ pero `arm_ids` y formas iguales (cambió `alpha`, pesos…) | Se acepta: hiperparámetros son valor, no forma; se anota `warning` en stderr. |
 | JSONL con línea corrupta al final (crash a mitad de escritura) | Replay descarta **solo la última línea** si no parsea; una línea corrupta no final ⇒ salida código 3. |
-| Rotación durante replay | No aplica: rotación solo tras escribir `report`/`expire`. |
+| Rotación durante replay | No aplica: la rotación se evalúa tras cada `append` (`select`/`report`/`expire`) en servicio, nunca en replay; va precedida de snapshot y arrastra los `select` vivos al fichero nuevo. Los `expire` escritos al inicio de un `select` cuentan aunque ese `select` acabe rechazado. |
 | `NaN` en `A` (imposible por construcción) | `select` DEBE assert `jnp.isfinite(score).all()` fuera del JIT sobre `diagnostics`; fallo ⇒ excepción y salida código 4 (estado corrupto; no se hace snapshot). |
 | SIGTERM durante escritura de snapshot | El rename es atómico: o queda el anterior o el nuevo, nunca mixto. |
+| SIGTERM/SIGINT con una petición en curso | Se registra `signal_received` + `shutdown_deferred`; la petición responde y después se cierra (snapshot + exit). Toda señal que llegue con un cierre ya iniciado (ordenado o fatal) se ignora: nunca hay un segundo `close` ni un snapshot que el cierre fatal prohíbe. |
+| Fallo de E/S persistente (WAL abrir/escribir/rotar, snapshot) | `journal_write_error` ⇒ salida 4 **con** snapshot de cierre; `snapshot_write_error` ⇒ salida 4 sin reintentar el snapshot. Nunca se responde OK a una petición cuya línea no llegó al journal. |
+| Señal entre el log de un fallo fatal/irrecuperable y su salida | `closing` se fija antes del log: la señal se registra y se ignora; el código de salida 3/4 se conserva (nunca un 0 que lo enmascare). |
+| Respuesta con `NaN`/`Infinity` (serialización) | Imposible por construcción (`allow_nan=False`); si ocurre ⇒ `numerical_integrity_error`, salida 4 sin snapshot. |
 | Reloj retrocede (NTP) | El ledger usa `time.time()`; un salto atrás puede rejuvenecer eventos; se acepta (ventanas se recuperan solas). Se registra `warning` si `now < last_ts − 1 s`. |
 | `select` en brazo cuyo `barrier_mu = 0` pero con ventana | `shadow = 0` pero `u ≥ 1` sigue enmascarando (FR-15). |
 
@@ -372,7 +386,7 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 - **NFR-01 Latencia**: `select_jit` p99 < 1 ms y `update_jit` p99 < 0.5 ms en CPU (`K_max=32, d=32, W_max=4`), medidos con `pytest-benchmark` tras warm-up, ≥ 1 000 iteraciones. Round-trip completo del daemon (`select` incl. featurizer, WAL flush y JSON) p99 < 3 ms en el mismo host.
 - **NFR-02 Warm-up**: tiempo desde arranque hasta `ready` < 5 s en CPU arm64/x86_64 (se reporta en `ready.warmup_ms`).
 - **NFR-03 Memoria**: estado ≤ 32·32·32·8 B ≈ 262 KiB por copia; el daemon retiene ≤ 2 copias (actual + snapshot en curso).
-- **NFR-04 Observabilidad**: stderr en JSON (`ts`, `level`, `event`, campos); eventos mínimos: `ready`, `snapshot_written`, `pending_expired`, `report_duplicate`, `clock_skew`.
+- **NFR-04 Observabilidad**: stderr en JSON (`ts`, `level`, `event`, campos); eventos mínimos: `ready`, `snapshot_written`, `pending_expired`, `report_duplicate`, `clock_skew`, `signal_received`, `shutdown_deferred`.
 - **NFR-05 Tipado**: `mypy --strict` sin errores; `jaxtyping` NO se usa (anotaciones de forma en docstrings).
-- **NFR-06 Determinismo**: mismo `seed` + misma secuencia de peticiones y reports ⇒ mismo JSONL bitwise (excepto `ts`).
+- **NFR-06 Determinismo**: mismo `seed` + misma secuencia de peticiones y reports ⇒ mismo JSONL bitwise, excepto `ts` y `decision_id` (UUIDv7 con parte aleatoria; la correspondencia `select`↔`report` sí es idéntica).
 - **NFR-07 Seguridad**: nunca `pickle`; `safetensors` para arrays; el daemon no abre sockets.

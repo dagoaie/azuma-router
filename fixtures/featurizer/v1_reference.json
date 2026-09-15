@@ -1,0 +1,27 @@
+{
+  "request": {
+    "task_kind": "code_edit",
+    "input_tokens": 1834,
+    "expected_output_tokens": 600,
+    "has_code": true,
+    "has_tools": true,
+    "has_images": false,
+    "agent_depth": 2,
+    "diff_lines": 120,
+    "priority": "normal"
+  },
+  "expected_x": [
+    1.0,
+    0.5439393447646846,
+    0.46314574533378994,
+    0.5206963425791126,
+    1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    1.0,
+    1.0,
+    0.0,
+    0.25,
+    0.0, 1.0, 0.0,
+    0.5439393447646846,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+  ]
+}

@@ -1,0 +1,32 @@
+schema_version = 1
+
+[bandit]
+seed = 42
+k_max = 32
+w_max = 4
+d = 32
+ridge_lambda = 1.0
+alpha = 1.0
+tau = 0.05
+epsilon_floor = 0.02
+w_quality = 1.0
+w_cost = 0.3
+w_latency = 0.2
+cost_budget_usd = 0.50
+latency_budget_s = 30.0
+pending_ttl_s = 3600
+snapshot_dir = "./.azuma"
+snapshot_every_updates = 100
+snapshot_every_s = 30
+decision_log_path = "./.azuma/decisions.jsonl"
+decision_log_max_bytes = 268435456
+
+[[arms]]
+model_id = "qwen3-coder"
+provider = "openrouter"
+billing_mode = "per_token"
+price_in_per_1m = nan
+price_out_per_1m = 1.20
+units_per_request = 0.0
+units_per_1k_tokens = 0.0
+barrier_mu = 0.0
