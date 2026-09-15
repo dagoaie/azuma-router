@@ -2,6 +2,8 @@
 
 import ast
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -398,3 +400,22 @@ def test_ope_no_jax_import() -> None:
                 imports.append(node.module)
 
     assert not any("jax" in mod for mod in imports), f"ope.py imports jax: {imports}"
+
+
+def test_ope_does_not_pull_jax_into_a_fresh_interpreter() -> None:
+    """JAX-1: the AST check above only sees ope.py's own `import` statements, so it cannot
+    catch jax loaded transitively through the package `__init__` or a shared type module
+    (FR-34: OPE MUST NOT import jax, not merely avoid an `import jax` line of its own)."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import azuma_router.ope; "
+            "assert 'jax' not in sys.modules, sorted(sys.modules)",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr

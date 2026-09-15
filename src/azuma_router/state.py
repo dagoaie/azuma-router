@@ -6,11 +6,24 @@ Complies with contract §3.3, §4.2, FR-07, and ADR-0001.
 from typing import Any
 
 import jax
-import jax.numpy as jnp
-import numpy as np
 
-from azuma_router.config import Config, to_static_config
-from azuma_router.types import F32, F64, I32, U32, BanditState, QuotaView, StaticConfig
+# jax.config.update is untyped upstream; this is the canonical x64 switch (ADR-0018). It must
+# run before any submodule touches jax.numpy -- see types.py/linucb.py for the same guard.
+jax.config.update("jax_enable_x64", True)  # type: ignore[no-untyped-call]
+
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+
+from azuma_router.config import Config, to_static_config  # noqa: E402
+from azuma_router.types import (  # noqa: E402
+    F32,
+    F64,
+    I32,
+    U32,
+    BanditState,
+    QuotaView,
+    StaticConfig,
+)
 
 
 def init_state(

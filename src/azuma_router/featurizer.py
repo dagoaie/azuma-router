@@ -7,8 +7,8 @@ import math
 
 import numpy as np
 
+from azuma_router.domain import Priority, RoutingRequest, TaskKind
 from azuma_router.errors import InvalidContextError
-from azuma_router.types import Priority, RoutingRequest, TaskKind
 
 FEATURIZER_VERSION = 1
 D = 32

@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from azuma_router.types import StaticConfig
+from azuma_router.domain import StaticConfig
 from azuma_router.wal import _read_journal
 
 

@@ -10,8 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from azuma_router.domain import MAX_INT31, StaticConfig
 from azuma_router.errors import ConfigError
-from azuma_router.types import MAX_INT31, StaticConfig
 
 # Softmax temperature floor: below this the policy collapses to argmax anyway (ADR-0008).
 MIN_TAU = 1e-6

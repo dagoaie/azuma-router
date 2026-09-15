@@ -20,7 +20,13 @@ PUBLIC_API = {
 
 
 def test_importing_package_enables_float64() -> None:
-    # ADR-0002/0018: x64 must be on before any submodule builds an array.
+    # ADR-0002/0018: x64 must be on before any submodule builds an array. Bare `import
+    # azuma_router` alone does NOT flip the switch any more (JAX-1): the package `__init__`
+    # must stay jax-free so `import azuma_router.ope` never pulls in jax transitively. The
+    # guard instead lives in each jax-consuming module (types.py/linucb.py/state.py) and runs
+    # before that module's own jax.numpy usage, so triggering one via the lazy public API
+    # (here, `select`) is what must land x64 before any array gets built.
+    assert azuma_router.select is not None
     assert jnp.zeros(1).dtype == jnp.float64
 
 

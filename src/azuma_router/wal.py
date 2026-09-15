@@ -20,9 +20,9 @@ if TYPE_CHECKING:
     from azuma_router.quota import QuotaLedger
 
 from azuma_router.config import Config
+from azuma_router.domain import Pending
 from azuma_router.errors import JournalWriteError, LedgerEventNotFoundError
 from azuma_router.featurizer import FEATURIZER_VERSION
-from azuma_router.types import Pending
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
