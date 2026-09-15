@@ -4,13 +4,13 @@ Complies with contract §3.9, FR-34, ADR-0008.
 MUST NOT import JAX.
 """
 
-import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from azuma_router.types import StaticConfig
+from azuma_router.wal import _read_journal
 
 
 def evaluate(
@@ -26,24 +26,25 @@ def evaluate(
     Returns:
         dict containing 'ips', 'dr', 'n', and 'ess'.
     """
-    path_obj = Path(log_path)
-    if not path_obj.exists():
+    active_path = Path(log_path)
+    # A pair fully closed before a rotation lives only in the retained rotated segment
+    # (OPE-ROT-1); read it first, then the active segment, matching wal.replay_log's
+    # convention (`<stem>.1<suffix>`). A select carried forward verbatim across the rotation
+    # boundary is keyed by decision_id, so re-seeing it in the active segment is a harmless
+    # overwrite, not a double count.
+    rotated_path = active_path.with_name(f"{active_path.stem}.1{active_path.suffix}")
+    segment_paths = [p for p in (rotated_path, active_path) if p.exists()]
+    if not segment_paths:
         return {"ips": 0.0, "dr": 0.0, "n": 0, "ess": 0.0}
 
     selects: dict[str, dict[str, Any]] = {}
     paired: list[tuple[dict[str, Any], dict[str, Any]]] = []
 
-    with path_obj.open("r", encoding="utf-8") as f:
-        for line in f:
-            line_str = line.strip()
-            if not line_str:
-                continue
-
-            try:
-                entry = json.loads(line_str)
-            except Exception:
-                continue
-
+    # Strict streaming decode shared with the WAL replay path (OPE-VAL-1): rejects NaN/Infinity
+    # and any malformed non-final line as corruption, and discards only a truncated final line
+    # (FR-24) instead of a blanket `except Exception: continue` that would silently drop it.
+    for path_obj in segment_paths:
+        for entry in _read_journal(path_obj):
             phase = entry.get("phase")
             d_id = entry.get("decision_id")
 

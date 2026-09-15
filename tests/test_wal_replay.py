@@ -45,6 +45,62 @@ def test_replay_reported_ac20() -> None:
     assert "018f6c2e-0000-7000-8000-000000000001" in applied_ids
 
 
+def test_replay_expired_fixture_ac20() -> None:
+    """FIXTURE-1: `expired.jsonl` exercises the terminal expire phase against the current
+    select schema -- the select's decision is neither pending nor applied afterwards."""
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    wal_path = Path("fixtures/wal/expired.jsonl")
+
+    pending_store, applied_reports, applied_ids, _rng_key, _selection_sequence = replay_log(
+        active_path=wal_path,
+        rotated_path=None,
+        snapshot_state_version=0,
+        snapshot_selection_sequence=0,
+        config=cfg,
+    )
+
+    assert len(pending_store) == 0
+    assert len(applied_reports) == 0
+    assert "018f6c2e-0000-7000-8000-000000000001" not in applied_ids
+
+
+def test_replay_rotated_fixture_is_carried_forward_and_closed_in_active(tmp_path: Path) -> None:
+    """FIXTURE-1: `rotated.jsonl` is the exact retained-segment shape `wal.rotate` produces --
+    one live select, later carried forward byte-identically into the active segment and closed
+    there by a report (AC-20)."""
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    rotated_path = Path("fixtures/wal/rotated.jsonl")
+    carried_select = rotated_path.read_text(encoding="utf-8")
+    report_entry = {
+        "phase": "report",
+        "decision_id": "018f6c2e-0000-7000-8000-000000000001",
+        "ts": 1757800010.0,
+        "state_version": 1,
+        "quality": 0.9,
+        "cost_usd": 0.0,
+        "latency_s": 11.2,
+        "actual_input_tokens": 1834,
+        "actual_output_tokens": 600,
+        "reward": 0.8253,
+        "actual_units": 1.0,
+    }
+    active_path = tmp_path / "decisions.jsonl"
+    active_path.write_text(carried_select + json.dumps(report_entry) + "\n", encoding="utf-8")
+
+    pending_store, applied_reports, applied_ids, _rng_key, selection_sequence = replay_log(
+        active_path=active_path,
+        rotated_path=rotated_path,
+        snapshot_state_version=0,
+        snapshot_selection_sequence=0,
+        config=cfg,
+    )
+
+    assert len(pending_store) == 0
+    assert len(applied_reports) == 1
+    assert "018f6c2e-0000-7000-8000-000000000001" in applied_ids
+    assert selection_sequence == 1
+
+
 def test_replay_corrupt_tail(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     wal_path = tmp_path / "corrupt_tail.jsonl"

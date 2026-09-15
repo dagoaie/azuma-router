@@ -219,6 +219,65 @@ def test_ope_uses_the_persisted_active_mask_not_the_logged_policy_to_find_active
     assert result["ips"] == result["dr"]  # exploit is 0 for every arm, so dr collapses to ips
 
 
+def test_ope_evaluates_pairs_closed_in_the_retained_rotated_segment_too(tmp_path: Path) -> None:
+    """OPE-ROT-1: `evaluate` must read the retained rotated segment (`<stem>.1<suffix>`, the
+    same convention as `wal.DecisionLog.rotate`) before the active one, exactly like
+    `wal.replay_log`, so a pair fully opened and closed before a rotation is not silently
+    dropped from the estimate. A select carried forward verbatim across the rotation boundary
+    must still be counted exactly once."""
+    static = replace(
+        to_static_config(load_config(Path("fixtures/config/azuma.valid.toml"))),
+        alpha=1.0,
+        tau=1.0,
+        epsilon_floor=0.0,
+    )
+
+    def _pair(decision_id: str, arm_index: int, reward: float) -> tuple[dict, dict]:
+        score = [10.0, 0.0] if arm_index == 0 else [0.0, 10.0]
+        select_entry = {
+            "phase": "select",
+            "decision_id": decision_id,
+            "arm_index": arm_index,
+            "propensity": 1.0,
+            "alpha": 1.0,
+            "policy": score,
+            "score": score,
+            "exploit": [0.0, 0.0],
+            "bonus": [0.0, 0.0],
+            "radius": [0.0, 0.0],
+            "active": [True, True],
+            "shadow_price": [0.0, 0.0],
+            "est_units": 0.0,
+        }
+        report_entry = {"phase": "report", "decision_id": decision_id, "reward": reward}
+        return select_entry, report_entry
+
+    select_1, report_1 = _pair("decision-1", arm_index=0, reward=1.0)
+    select_2, report_2 = _pair("decision-2", arm_index=1, reward=0.5)
+    select_3, report_3 = _pair("decision-3", arm_index=0, reward=2.0)
+
+    active_path = tmp_path / "decisions.jsonl"
+    rotated_path = tmp_path / "decisions.1.jsonl"
+
+    # decision-1 opens and closes entirely inside the retained rotated segment; decision-2 is a
+    # live pending select at rotation time, carried forward byte-identically into the active one.
+    rotated_path.write_text(
+        "".join(json.dumps(e) + "\n" for e in (select_1, report_1, select_2)), encoding="utf-8"
+    )
+    active_path.write_text(
+        "".join(json.dumps(e) + "\n" for e in (select_2, report_2, select_3, report_3)),
+        encoding="utf-8",
+    )
+
+    result = evaluate(active_path, static)
+
+    # A fix that only re-reads the active segment would see decision-2 and decision-3 alone
+    # (n == 2); a fix that double-counts the carried-forward select would report n == 4.
+    assert result["n"] == 3
+    assert 0.5 <= result["ips"] <= 2.0
+    assert result["ess"] > 0.0
+
+
 def test_ope_orphan_report(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     static = to_static_config(cfg)
@@ -236,6 +295,93 @@ def test_ope_orphan_report(tmp_path: Path) -> None:
     with pytest.raises(ValueError) as exc_info:
         evaluate(log_path, static)
     assert "orphan-uuid" in str(exc_info.value)
+
+
+def test_ope_rejects_a_non_finite_json_constant_instead_of_silently_computing_nan(
+    tmp_path: Path,
+) -> None:
+    """OPE-VAL-1: the writer never emits NaN/Infinity (`allow_nan=False`, wal.py); a NaN found in
+    a decision line is corruption and must raise, not be silently decoded and propagated into the
+    estimate."""
+    static = to_static_config(load_config(Path("fixtures/config/azuma.valid.toml")))
+    log_path = tmp_path / "nan-constant.jsonl"
+    # Not valid JSON per RFC 8259, but Python's json.loads accepts it unless parse_constant is
+    # overridden -- exactly the gap that let a corrupt or malicious NaN through silently.
+    corrupt_line = (
+        '{"phase": "select", "decision_id": "decision-1", "arm_index": 0, "propensity": 1.0, '
+        '"alpha": 1.0, "policy": [1.0], "score": [NaN], "exploit": [0.0], "bonus": [0.0], '
+        '"radius": [0.0], "active": [true], "shadow_price": [0.0], "est_units": 0.0}\n'
+    )
+    log_path.write_text(corrupt_line, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-finite"):
+        evaluate(log_path, static)
+
+
+def test_ope_raises_on_a_malformed_non_final_line_instead_of_silently_skipping_it(
+    tmp_path: Path,
+) -> None:
+    """OPE-VAL-1: a blanket `except Exception: continue` would silently drop a corrupt line and
+    understate `n` without any signal; only a truncated *final* line (a crash artefact, FR-24) is
+    safe to discard. The malformed line here precedes a complete, pairable select+report so a fix
+    that still silently skips it would report n == 1 instead of raising."""
+    static = to_static_config(load_config(Path("fixtures/config/azuma.valid.toml")))
+    log_path = tmp_path / "malformed-middle-line.jsonl"
+    select_entry = {
+        "phase": "select",
+        "decision_id": "decision-1",
+        "arm_index": 0,
+        "propensity": 1.0,
+        "alpha": 1.0,
+        "policy": [1.0],
+        "score": [0.0],
+        "exploit": [0.0],
+        "bonus": [0.0],
+        "radius": [0.0],
+        "active": [True],
+        "shadow_price": [0.0],
+        "est_units": 0.0,
+    }
+    report_entry = {"phase": "report", "decision_id": "decision-1", "reward": 1.0}
+    log_path.write_text(
+        "not json at all\n" + json.dumps(select_entry) + "\n" + json.dumps(report_entry) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="line 1"):
+        evaluate(log_path, static)
+
+
+def test_ope_tolerates_a_truncated_final_line_as_a_crash_artefact(tmp_path: Path) -> None:
+    """OPE-VAL-1: an unterminated final line (no trailing newline, incomplete JSON) is the
+    expected shape of a crash mid-append (FR-24) and must not be treated as corruption -- the
+    preceding complete pair must still be evaluated."""
+    static = to_static_config(load_config(Path("fixtures/config/azuma.valid.toml")))
+    log_path = tmp_path / "truncated-final-line.jsonl"
+    select_entry = {
+        "phase": "select",
+        "decision_id": "decision-1",
+        "arm_index": 0,
+        "propensity": 1.0,
+        "alpha": 1.0,
+        "policy": [1.0],
+        "score": [0.0],
+        "exploit": [0.0],
+        "bonus": [0.0],
+        "radius": [0.0],
+        "active": [True],
+        "shadow_price": [0.0],
+        "est_units": 0.0,
+    }
+    report_entry = {"phase": "report", "decision_id": "decision-1", "reward": 1.0}
+    log_path.write_text(
+        json.dumps(select_entry) + "\n" + json.dumps(report_entry) + "\n" + '{"phase": "select',
+        encoding="utf-8",
+    )
+
+    result = evaluate(log_path, static)
+
+    assert result["n"] == 1
 
 
 def test_ope_no_jax_import() -> None:

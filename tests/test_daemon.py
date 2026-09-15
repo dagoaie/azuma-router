@@ -1522,6 +1522,42 @@ def test_select_non_finite_score_raises_numerical_integrity_error(
     router.close()
 
 
+def _force_nan_score_with_collapsed_policy(monkeypatch: pytest.MonkeyPatch, arm_index: int) -> None:
+    """An active arm's score goes NaN while its policy underflows to exactly zero: the
+    epsilon_floor = 0 collapse that a policy-gated finiteness check (instead of `active`) masks
+    (NUM-1). The arm stays structurally active (`diag.active` untouched)."""
+    real_select_jit = daemon_mod.select_jit
+
+    def collapsed_select_jit(state: Any, x: Any, qv: Any, static: Any) -> tuple[Any, Any, Any, Any]:
+        state_next, sampled_arm, propensity, diag = real_select_jit(state, x, qv, static)
+        score = np.array(diag.score)
+        policy = np.array(diag.policy)
+        score[arm_index] = np.nan
+        policy[arm_index] = 0.0
+        return state_next, sampled_arm, propensity, diag._replace(score=score, policy=policy)
+
+    monkeypatch.setattr(daemon_mod, "select_jit", collapsed_select_jit)
+
+
+def test_select_raises_numerical_integrity_error_for_an_active_arm_with_zero_underflowed_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NUM-1: score finiteness must be gated by the structural `active` mask, not `policy > 0` —
+    a NaN score on an arm whose policy legitimately underflowed to zero must not be masked."""
+    router = _booted_router(tmp_path)
+    _force_nan_score_with_collapsed_policy(monkeypatch, arm_index=0)
+
+    orig_ver = router.state_version
+    with pytest.raises(NumericalIntegrityError):
+        router.select({"request": REQUEST})
+
+    assert router.state_version == orig_ver
+    assert len(router.pending_store) == 0
+    assert (tmp_path / "decisions.jsonl").read_text(encoding="utf-8") == ""
+
+    router.close()
+
+
 # Journal Write Error Stdio Test
 @pytest.mark.parametrize(
     "boot_error",
@@ -1607,6 +1643,23 @@ def test_serve_exits_4_when_select_hits_a_non_finite_score(
     assert code == 4
     assert [e["event"] for e in events if e["level"] == "error"] == ["numerical_integrity_error"]
     assert "non_finite" not in capsys.readouterr().err, "serve owns the fatal log; no double log"
+    assert _snapshot_bytes(tmp_path) is None, "corrupt state must never be snapshotted"
+
+
+def test_serve_exits_4_on_a_non_finite_score_whose_policy_underflowed_to_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """NUM-1: this must fail as numerical_integrity_error, never journal_write_error via a
+    strict-JSON append of the NaN, and must never publish a snapshot of the corrupt state."""
+    router = _booted_router(tmp_path)
+    _force_nan_score_with_collapsed_policy(monkeypatch, arm_index=0)
+    capsys.readouterr()  # drop boot logs
+
+    code, events = _serve_one_request(router, "select", {"request": REQUEST})
+
+    assert code == 4
+    assert [e["event"] for e in events if e["level"] == "error"] == ["numerical_integrity_error"]
+    assert (tmp_path / "decisions.jsonl").read_text(encoding="utf-8") == ""
     assert _snapshot_bytes(tmp_path) is None, "corrupt state must never be snapshotted"
 
 

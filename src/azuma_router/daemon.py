@@ -405,11 +405,13 @@ class Router:
         x_jax = to_jax_array(x_np)
         state_next, arm_idx, propensity, diag = select_jit(self.state, x_jax, qv, self.static)
 
-        # Abort if non-finite scores outside JIT
+        # Abort if non-finite scores outside JIT. Gate by the structural `active` mask, not by
+        # `policy > 0` (NUM-1): an active arm's policy can legitimately underflow to exactly zero
+        # under epsilon_floor = 0, which would otherwise mask a NaN score as harmless.
         n_arms = len(self.config.arms)
+        active_arr = np.array(diag.active)
         active_scores = np.array(diag.score[:n_arms])
-        policy_active = np.array(diag.policy[:n_arms]) > 0
-        if not np.all(np.isfinite(np.where(policy_active, active_scores, 0.0))):
+        if not np.all(np.isfinite(np.where(active_arr[:n_arms], active_scores, 0.0))):
             raise NumericalIntegrityError("Non-finite score detected in select")
 
         if bool(diag.no_arm_available):
@@ -439,7 +441,6 @@ class Router:
         }
         # Sentinel by the real active mask, not by a possibly-underflowed policy (OPE-2): an
         # active arm's score must survive even when epsilon_floor gave it zero policy mass.
-        active_arr = np.array(diag.active)
         score_logged = np.where(active_arr, np.array(diag.score), -1e9)
         select_entry = {
             "phase": "select",
