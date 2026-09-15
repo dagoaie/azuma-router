@@ -2,6 +2,7 @@
 
 import ast
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -98,6 +99,36 @@ def test_ope_different_policy() -> None:
     assert res_cand["ips"] != res_logged["ips"]
     assert res_cand["dr"] != res_logged["dr"]
     assert res_cand["ess"] < res_cand["n"]
+
+
+def test_ope_preserves_each_arm_logged_quota_penalty(tmp_path: Path) -> None:
+    """Candidate scores retain the per-arm quota penalty already encoded in `score`."""
+    static = replace(
+        to_static_config(load_config(Path("fixtures/config/azuma.valid.toml"))), tau=1.0
+    )
+    log_path = tmp_path / "heterogeneous-quota.jsonl"
+    entries = [
+        {
+            "phase": "select",
+            "decision_id": "decision-1",
+            "arm_index": 0,
+            "propensity": 0.5,
+            "alpha": 1.0,
+            "policy": [0.5, 0.5],
+            "score": [10.0, 0.0],
+            "exploit": [0.0, 0.0],
+            "bonus": [0.0, 0.0],
+            "shadow_price": [0.0, 10.0],
+            "est_units": 0.0,
+        },
+        {"phase": "report", "decision_id": "decision-1", "reward": 1.0},
+    ]
+    log_path.write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
+
+    result = evaluate(log_path, static)
+
+    assert result["ips"] > 1.9
+    assert result["dr"] > 1.9
 
 
 def test_ope_orphan_report(tmp_path: Path) -> None:

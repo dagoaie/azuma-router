@@ -65,8 +65,7 @@ def evaluate(
     for s_entry, r_entry in paired:
         exploit = np.array(s_entry["exploit"], dtype=np.float64)
         logged_bonus = np.array(s_entry["bonus"], dtype=np.float64)
-        shadow_price = np.array(s_entry["shadow_price"], dtype=np.float64)
-        est_units = float(s_entry.get("est_units", 0.0))
+        logged_score = np.array(s_entry["score"], dtype=np.float64)
 
         # Reconstruct candidate bonus
         logged_alpha = float(s_entry.get("alpha", 1.0))
@@ -75,7 +74,9 @@ def evaluate(
         else:
             bonus_cand = logged_bonus
 
-        score_cand = exploit + bonus_cand - shadow_price * est_units
+        # The logged score already includes each arm's quota penalty. Candidate evaluation changes
+        # only the exploration term, so it must not use the selected arm's units for every arm.
+        score_cand = logged_score + bonus_cand - logged_bonus
 
         # Active arms from logged policy
         logged_policy = np.array(s_entry["policy"], dtype=np.float64)

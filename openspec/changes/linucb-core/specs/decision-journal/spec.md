@@ -12,7 +12,7 @@ Antes de responder a `select`, el daemon SHALL haber hecho `append` + `flush` de
 - **THEN** el `flush` ocurre antes de que `select` retorne y el fichero contiene la línea `select` (AC-17)
 
 ### Requirement: Orden del report e idempotencia
-`report` sobre un `decision_id` pendiente SHALL, en este orden: escribir `phase = "report"` con `state_version` ya incrementado, corregir el ledger, aplicar `update`, mover la decisión a aplicada. Un `report` repetido sobre una decisión aplicada SHALL responder `{"applied": false, "reason": "duplicate", "state_version": n}` sin escribir ninguna línea (FR-21).
+`report` sobre un `decision_id` pendiente SHALL, en este orden: escribir `phase = "report"` con `state_version` ya incrementado, corregir el ledger, aplicar `update`, mover la decisión a aplicada. Antes de publicar cualquier snapshot, el daemon SHALL hacer `flush + fsync` del WAL para que el snapshot no pueda contener un `report` que se perdería de su journal. Un `report` repetido sobre una decisión aplicada SHALL responder `{"applied": false, "reason": "duplicate", "state_version": n}` sin escribir ninguna línea (FR-21).
 
 #### Scenario: report duplicado
 - **WHEN** se envía el mismo `report` dos veces
@@ -50,6 +50,14 @@ Al arrancar, el daemon SHALL reconstruir el `PendingStore` leyendo el fichero ro
 #### Scenario: línea semánticamente inválida
 - **WHEN** una línea parsea como JSON pero no es un registro válido (`decision_id` ausente, `x` de dimensión incorrecta o con `NaN`, `arm_index` que no corresponde a `arm_id`, `propensity == 0`, `reward` fuera de `[0, 1]`, `expire` sin `select`)
 - **THEN** stderr contiene `replay_failed` y el proceso sale con código 3 sin haber aplicado ningún `update`
+
+#### Scenario: report histórico de un select posterior al snapshot
+- **WHEN** un `select` con `selection_sequence` posterior al snapshot tiene un `report` con `state_version` igual o menor al snapshot
+- **THEN** stderr contiene `replay_failed` y el proceso sale con código 3
+
+#### Scenario: versión de select posterior al snapshot inconsistente
+- **WHEN** un `select` posterior al snapshot no declara la versión formada por el snapshot y los `report` posteriores ya retenidos
+- **THEN** stderr contiene `replay_failed` y el proceso sale con código 3
 
 #### Scenario: cola corrupta
 - **WHEN** la última línea del fichero está truncada

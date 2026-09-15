@@ -772,6 +772,34 @@ def test_select_never_takes_the_cadence_snapshot_but_report_does(tmp_path: Path)
     router.close()
 
 
+def test_snapshot_syncs_the_wal_before_snapshot_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    router = _booted_router(tmp_path)
+    assert router.dlog is not None
+    calls: list[str] = []
+    real_sync = router.dlog.sync
+    real_write_snapshot = daemon_mod.write_snapshot
+
+    def sync() -> None:
+        calls.append("sync")
+        real_sync()
+
+    def write_snapshot_after_wal_sync(*args: object, **kwargs: object) -> tuple[Path, int]:
+        assert calls == ["sync"]
+        calls.append("write_snapshot")
+        return real_write_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(router.dlog, "sync", sync)
+    monkeypatch.setattr(daemon_mod, "write_snapshot", write_snapshot_after_wal_sync)
+
+    router.snapshot({})
+
+    assert calls == ["sync", "write_snapshot"]
+    monkeypatch.undo()
+    router.close()
+
+
 def _booted_router_with_long_pending_ttl(tmp_path: Path, clock: list[float]) -> Router:
     """Fixture config with pending_ttl_s longer than every quota window (2 x weekly)."""
     cfg = load_fixture_config_with(tmp_path, **{"pending_ttl_s = 3600": "pending_ttl_s = 2000000"})
@@ -883,6 +911,72 @@ def test_boot_exits_3_on_a_semantically_corrupt_journal(
 
     assert code == 3
     assert "replay_failed" in events
+
+
+def test_boot_rejects_a_historic_report_for_a_post_snapshot_select(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A report cannot bypass replay by claiming the preceding snapshot's state version."""
+    router = _booted_router(tmp_path)
+    first_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    router.report(_report_params(first_id))
+    router.snapshot({})
+
+    second_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    router.report(_report_params(second_id))
+    assert router.dlog is not None
+    router.dlog.close()
+
+    journal = tmp_path / "decisions.jsonl"
+    _rewrite_journal(
+        journal,
+        lambda entries: next(
+            entry
+            for entry in entries
+            if entry.get("phase") == "report" and entry["decision_id"] == second_id
+        ).__setitem__("state_version", 1),
+    )
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "replay_failed" in events
+
+
+@pytest.mark.parametrize("invalid_state_version", [0, 2])
+def test_boot_rejects_an_inconsistent_post_snapshot_select_state_version(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], invalid_state_version: int
+) -> None:
+    router = _booted_router(tmp_path)
+    first_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    router.report(_report_params(first_id))
+    router.snapshot({})
+    second_id = router.select({"request": REQUEST, "allowed_arms": [CODEX]})["decision_id"]
+    assert router.dlog is not None
+    router.dlog.close()
+
+    _rewrite_journal(
+        tmp_path / "decisions.jsonl",
+        lambda entries: next(
+            entry
+            for entry in entries
+            if entry.get("phase") == "select" and entry["decision_id"] == second_id
+        ).__setitem__("state_version", invalid_state_version),
+    )
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "replay_failed" in events
+
+
+def test_snapshot_fails_when_the_wal_is_closed(tmp_path: Path) -> None:
+    router = _booted_router(tmp_path)
+    assert router.dlog is not None
+    router.dlog.close()
+
+    with pytest.raises(JournalWriteError, match="WAL sync failed"):
+        router.snapshot({})
 
 
 def test_boot_exits_3_on_recursively_nested_journal_json(

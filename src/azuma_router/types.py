@@ -209,6 +209,8 @@ class Pending:
     est_units: float
     ledger_event_id: int
     state_version: int
+    selection_sequence: int
+    arm_id: str
     select_entry: dict[str, Any]  # journal line, carried forward verbatim on WAL rotation
 
 

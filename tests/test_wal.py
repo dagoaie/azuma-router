@@ -112,6 +112,8 @@ def test_pending_store_sweep() -> None:
         est_units=1.0,
         ledger_event_id=1,
         state_version=0,
+        selection_sequence=1,
+        arm_id="arm-1",
         select_entry={"phase": "select", "decision_id": "id-1"},
     )
     p2 = Pending(
@@ -123,6 +125,8 @@ def test_pending_store_sweep() -> None:
         est_units=1.0,
         ledger_event_id=2,
         state_version=0,
+        selection_sequence=2,
+        arm_id="arm-2",
         select_entry={"phase": "select", "decision_id": "id-2"},
     )
 
@@ -173,4 +177,16 @@ def test_rotation_fsyncs_the_journal_directory_after_the_rename(
     dlog.rotate(carry_forward=[])
 
     assert tmp_path.stat().st_ino in fsynced_inodes
+    dlog.close()
+
+
+def test_sync_fsyncs_the_active_journal_before_snapshot_publication(
+    tmp_path: Path, fsynced_inodes: list[int]
+) -> None:
+    dlog = DecisionLog(path=tmp_path / "decisions.jsonl")
+    dlog.append({"phase": "select", "decision_id": "d1"})
+
+    dlog.sync()
+
+    assert (tmp_path / "decisions.jsonl").stat().st_ino in fsynced_inodes
     dlog.close()

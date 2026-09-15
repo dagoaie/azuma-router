@@ -477,6 +477,8 @@ class Router:
             est_units=est_u,
             ledger_event_id=eid,
             state_version=self.state_version,
+            selection_sequence=next_selection_sequence,
+            arm_id=chosen_arm.arm_id,
             select_entry=select_entry,
         )
         self.pending_store.put(pending)
@@ -590,8 +592,8 @@ class Router:
         if self.dlog is not None:
             self.dlog.append(report_entry)
 
-        # The line is durable: from here on, memory must reach the journaled state or the
-        # process must die so replay reconciles it on restart (P5-MF-1).
+        # The flushed line survives a process crash. From here on, memory must reach the journaled
+        # state or the process must die so replay reconciles it on restart (P5-MF-1).
         try:
             self.ledger.correct(pending.ledger_event_id, arm.arm_id, actual_units)
             self.state_version = next_state_version
@@ -664,6 +666,8 @@ class Router:
             config_sha256=compute_config_sha256(self.config),
         )
 
+        if self.dlog is not None:
+            self.dlog.sync()
         target_path, n_bytes = write_snapshot(self.snapshot_dir, self.state, self.ledger, meta)
         self.updates_since_snapshot = 0
         self.last_snapshot_ts = now

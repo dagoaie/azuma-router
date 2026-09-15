@@ -90,6 +90,8 @@ def test_jsonrpc_loop_framing_and_errors(tmp_path: Path) -> None:
     assert out_unk["error"]["code"] == -32601
 
     # 5. Notification without id -> process without stdout response
+    router = Router(config=cfg, snapshot_dir=s_dir, decision_log_path=l_path)
+    router.boot()
     stdin_notif = io.StringIO('{"jsonrpc":"2.0","method":"snapshot","params":{}}\n')
     stdout_notif = io.StringIO()
     stderr_notif = io.StringIO()

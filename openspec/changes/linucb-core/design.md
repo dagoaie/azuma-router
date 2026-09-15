@@ -53,7 +53,7 @@ Cada decisión cita el ADR que la fija; aquí se describe **cómo** se materiali
 Framing por líneas, sin `Content-Length`. `Router` (dicts in/out, lanza `RpcError`) es la unidad testeable sin subprocess; `serve(stdin, stdout, stderr, router)` solo parsea, despacha y serializa. Códigos −32001…−32006 fijos. Señales ⇒ flag comprobada entre peticiones ⇒ snapshot ⇒ salida 0. Transportes alternativos: F1/F14 (nunca dual-path).
 
 ### D11 — Journal JSONL como WAL y dataset OPE (ADR-0011)
-Una línea por fase (`select`/`report`/`expire`), claves en orden fijo, `separators=(",", ":")`. `append = write + flush`, **sin** `fsync` por línea (costaría ~ms por decisión; se acepta perder la última línea ante corte de energía, no ante crash de proceso; el snapshot sí hace fsync) — F13. Rotación a `.1.jsonl` (máx. 1) evaluada tras **cualquier** `append` (`select`/`report`/`expire`, incluido el `expire` de un `report` tardío y el barrido del RPC `snapshot`): snapshot primero, luego rename + fsync del directorio del journal; el fichero activo nuevo arranca con los `select` vivos. Rotar es responsabilidad de `snapshot()`, así ningún camino la olvida.
+Una línea por fase (`select`/`report`/`expire`), claves en orden fijo, `separators=(",", ":")`. `append = write + flush`, **sin** `fsync` por línea (costaría ~ms por decisión); inmediatamente antes de publicar cualquier snapshot, el daemon hace `flush + fsync` del WAL, de modo que un snapshot durable nunca puede adelantar a un `report` no durable. Rotación a `.1.jsonl` (máx. 1) evaluada tras **cualquier** `append` (`select`/`report`/`expire`, incluido el `expire` de un `report` tardío y el barrido del RPC `snapshot`): snapshot primero, luego rename + fsync del directorio del journal; el fichero activo nuevo arranca con los `select` vivos. Rotar es responsabilidad de `snapshot()`, así ningún camino la olvida.
 
 ### D12 — API pública mínima (ADR-0012)
 `__all__ = [select, update, BanditState, StaticConfig, QuotaLedger, snapshot, restore]`. Todo lo demás es interno; el daemon es el consumidor canónico.
@@ -104,7 +104,7 @@ Dependencias solo hacia abajo: `daemon → {wal, snapshot, quota, reward, featur
 ## Risks / Trade-offs
 
 - [Riesgo] Cholesky falla si `A` deja de ser SPD por acumulación numérica → Mitigación: float64, `ridge_lambda > 0`, test de propiedad AC-11 sobre 1 000 updates; `select` aborta con código 4 si `score` no es finito.
-- [Riesgo] `fsync` ausente por línea del journal pierde la última decisión ante corte de energía → Mitigación: aceptado y documentado (F13); solo afecta a una decisión pendiente, nunca al estado aprendido (snapshot con fsync).
+- [Riesgo] `fsync` ausente por línea del journal puede perder la última decisión ante corte de energía → Mitigación: aceptado y documentado (F13); antes de cada snapshot se sincroniza el WAL, por lo que un snapshot durable nunca contiene un `report` ausente del journal.
 - [Riesgo] Recompilación inadvertida si algún argumento no estático cambia de forma o dtype → Mitigación: contador de compilaciones expuesto en `health` y AC-12 con 10 000 llamadas variadas.
 - [Riesgo] Reloj de pared retrocede (NTP) y rejuvenece eventos del ledger → Mitigación: aceptado; las ventanas se autocorrigen; se registra `clock_skew` en stderr.
 - [Riesgo] `PendingStore` crece sin cota si el cliente nunca reporta → Mitigación: TTL 3600 s con barrido en cada `select`/`snapshot` y `expire` en el journal.

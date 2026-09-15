@@ -86,6 +86,14 @@ class DecisionLog:
         except Exception as err:
             raise JournalWriteError(f"WAL append failed: {err}") from err
 
+    def sync(self) -> None:
+        """Makes all appended journal entries durable before snapshot publication."""
+        try:
+            self.file.flush()
+            os.fsync(self.file.fileno())
+        except Exception as err:
+            raise JournalWriteError(f"WAL sync failed: {err}") from err
+
     def needs_rotation(self) -> bool:
         """True once the active segment exceeds max_bytes; the file is always open, so it exists."""
         try:
@@ -352,6 +360,8 @@ def _decode_select(entry: dict[str, Any], config: Config) -> Pending:
         est_units=_finite_number(entry, "est_units", d_id, low=0.0),
         ledger_event_id=_integer(entry, "ledger_event_id", d_id, minimum=1),
         state_version=_integer(entry, "state_version", d_id, minimum=0),
+        selection_sequence=_integer(entry, "selection_sequence", d_id, minimum=1),
+        arm_id=entry["arm_id"],
         select_entry=entry,
     )
 
@@ -393,6 +403,13 @@ def _replay_select(entry: dict[str, Any], rs: _ReplayState) -> None:
         return
     selection_sequence, rng_key = _decode_rng_transition(entry, d_id)
     if selection_sequence > rs.snapshot_selection_sequence:
+        expected_state_version = rs.snapshot_state_version + len(rs.applied_reports)
+        if pending.state_version != expected_state_version:
+            msg = (
+                f"WAL select for decision {d_id} has state_version {pending.state_version}; "
+                f"expected {expected_state_version}"
+            )
+            raise ValueError(msg)
         expected = rs.selection_sequence + 1
         if selection_sequence != expected:
             msg = (
@@ -453,6 +470,11 @@ def _replay_report(entry: dict[str, Any], rs: _ReplayState) -> None:
     _integer(entry, "actual_output_tokens", d_id, minimum=0)
     reward = _finite_number(entry, "reward", d_id, low=0.0, high=1.0)
     actual_units = _finite_number(entry, "actual_units", d_id, low=0.0)
+    if (
+        select.selection_sequence > rs.snapshot_selection_sequence
+        and state_version <= rs.snapshot_state_version
+    ):
+        raise ValueError(f"WAL report for decision {d_id} predates its post-snapshot select")
     rs.pending_store.pop(d_id)
     rs.pending_store.mark_applied(d_id)
     rs.applied_ids.add(d_id)
@@ -467,7 +489,7 @@ def _replay_report(entry: dict[str, Any], rs: _ReplayState) -> None:
         raise ValueError(msg)
     if rs.ledger is not None:
         try:
-            rs.ledger.correct(select.ledger_event_id, select.select_entry["arm_id"], actual_units)
+            rs.ledger.correct(select.ledger_event_id, select.arm_id, actual_units)
         except LedgerEventNotFoundError as err:
             raise ValueError(f"WAL report for decision {d_id}: {err}") from err
     x_arr = np.array(select.x, dtype=np.float64)

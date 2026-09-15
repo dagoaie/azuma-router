@@ -5,7 +5,7 @@ Evaluación off-policy (IPS y Doubly-Robust) de una política candidata sobre el
 ## ADDED Requirements
 
 ### Requirement: Estimadores IPS y DR
-`ope.evaluate(log_path, candidate_static) -> {ips, dr, n, ess}` SHALL emparejar cada línea `report` con su `select`, usar la `propensity` registrada como política de logging, reconstruir el `score` candidato a partir de `exploit`, `bonus` (reescalado por `alpha_candidate / alpha_logged`) y `shadow_price` registrados sobre la `x` registrada, calcular la política candidata con la misma fórmula softmax en NumPy y devolver IPS, DR (con `r̂ = exploit` registrado), número de pares `n` y tamaño muestral efectivo `ess`. MUST NOT importar `jax` (FR-34).
+`ope.evaluate(log_path, candidate_static) -> {ips, dr, n, ess}` SHALL emparejar cada línea `report` con su `select`, usar la `propensity` registrada como política de logging, y reconstruir el `score` candidato como `score_logged + bonus_candidate − bonus_logged`, donde `bonus_candidate` reescala el `bonus` registrado por `alpha_candidate / alpha_logged`; así conserva la penalización de cuota específica de cada brazo ya incluida en el `score` registrado. Deberá calcular la política candidata con la misma fórmula softmax en NumPy y devolver IPS, DR (con `r̂ = exploit` registrado), número de pares `n` y tamaño muestral efectivo `ess`. MUST NOT importar `jax` (FR-34).
 
 #### Scenario: misma política
 - **WHEN** se evalúa `fixtures/ope/decisions.jsonl` con la misma configuración que lo generó
