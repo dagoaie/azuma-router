@@ -240,12 +240,13 @@ def test_snapshot_meta_roundtrip() -> None:
         is_subscription=(True,) + (False,) * 31,
     )
     meta = SnapshotMeta(
-        schema_version=1,
+        schema_version=2,
         state_version=42,
         featurizer_version=1,
         arm_ids=["gpt-5-codex@openai-codex"],
         static=sc,
         seed=42,
+        selection_sequence=42,
         created_at="2026-09-14T12:00:00Z",
         ledger={"gpt-5-codex@openai-codex": []},
         config_sha256="abc123hash",

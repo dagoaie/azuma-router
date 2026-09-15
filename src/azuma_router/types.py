@@ -222,6 +222,7 @@ class SnapshotMeta:
     arm_ids: list[str]
     static: StaticConfig
     seed: int
+    selection_sequence: int
     created_at: str
     ledger: dict[str, Any]
     config_sha256: str
@@ -234,6 +235,7 @@ class SnapshotMeta:
             "arm_ids": self.arm_ids,
             "static": asdict(self.static),
             "seed": self.seed,
+            "selection_sequence": self.selection_sequence,
             "created_at": self.created_at,
             "ledger": self.ledger,
             "config_sha256": self.config_sha256,
@@ -265,6 +267,7 @@ class SnapshotMeta:
             arm_ids=data["arm_ids"],
             static=static,
             seed=data["seed"],
+            selection_sequence=data["selection_sequence"],
             created_at=data["created_at"],
             ledger=data["ledger"],
             config_sha256=data["config_sha256"],

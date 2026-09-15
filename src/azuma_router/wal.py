@@ -5,6 +5,7 @@ Complies with contract §3.6, §4.4, FR-20..FR-24, ADR-0011, ADR-0016.
 
 import json
 import os
+import stat
 from collections import OrderedDict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
@@ -21,6 +22,20 @@ from azuma_router.config import Config
 from azuma_router.errors import JournalWriteError, LedgerEventNotFoundError
 from azuma_router.types import Pending
 
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+
+def make_private_dir(directory: Path) -> None:
+    """Creates the directory if missing and restricts it to the owner (FR-25, RR7-4)."""
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(PRIVATE_DIR_MODE)
+
+
+def make_private_file(file_path: Path) -> None:
+    """Restricts a file this process just wrote to the owner (FR-25, RR7-4)."""
+    file_path.chmod(PRIVATE_FILE_MODE)
+
 
 def fsync_directory(directory: Path) -> None:
     """Makes directory-entry changes (renames, new files) durable (P3-SF-3)."""
@@ -31,6 +46,20 @@ def fsync_directory(directory: Path) -> None:
         os.close(dir_fd)
 
 
+def _open_private_wal(path: Path) -> TextIOWrapper:
+    """Opens one regular WAL file without following symlinks and enforces mode 0600."""
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW
+    fd = os.open(str(path), flags, PRIVATE_FILE_MODE)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"WAL path is not a regular file: {path}")
+        os.fchmod(fd, PRIVATE_FILE_MODE)
+        return os.fdopen(fd, "a", encoding="utf-8")
+    except Exception:
+        os.close(fd)
+        raise
+
+
 class DecisionLog:
     """Append-only JSONL log writer with max-byte rotation owned by Router (ADR-0011 / MF-2)."""
 
@@ -39,7 +68,7 @@ class DecisionLog:
         self.max_bytes = max_bytes
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.file: TextIOWrapper = self.path.open("a", encoding="utf-8")
+            self.file = _open_private_wal(self.path)
         except OSError as err:
             raise JournalWriteError(f"WAL open failed: {err}") from err
 
@@ -76,7 +105,7 @@ class DecisionLog:
         self.file.close()
         rotated_path = self.path.with_name(f"{self.path.stem}.1{self.path.suffix}")
         self.path.replace(rotated_path)
-        self.file = self.path.open("a", encoding="utf-8")
+        self.file = _open_private_wal(self.path)
         fsync_directory(self.path.parent)  # rename + new active segment durable (P3-SF-3)
         for entry in carry_forward:
             self.append(entry)
@@ -157,12 +186,15 @@ class _ReplayState:
     """Mutable accumulator threaded through the per-phase replay handlers."""
 
     snapshot_state_version: int
+    snapshot_selection_sequence: int
     ledger: "QuotaLedger | None"
     pending_ttl_s: float
     pending_store: PendingStore = field(default_factory=PendingStore)
     applied_reports: list[tuple[int, np.ndarray, int, float]] = field(default_factory=list)
     applied_ids: set[str] = field(default_factory=set)
     select_by_id: dict[str, dict[str, Any]] = field(default_factory=dict)
+    rng_key: np.ndarray | None = None
+    selection_sequence: int = 0
 
 
 def _read_journal(fpath: Path) -> Iterator[dict[str, Any]]:
@@ -188,6 +220,30 @@ def _replay_select(entry: dict[str, Any], rs: _ReplayState) -> None:
     if "ledger_event_id" not in entry:
         raise ValueError(f"Missing ledger_event_id in select line for decision {d_id}")
     eid = int(entry["ledger_event_id"])
+    raw_sequence = entry.get("selection_sequence")
+    raw_rng_key = entry.get("rng_key")
+    if (
+        isinstance(raw_sequence, bool)
+        or not isinstance(raw_sequence, int)
+        or raw_sequence <= 0
+        or not isinstance(raw_rng_key, list)
+        or len(raw_rng_key) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in raw_rng_key)
+        or any(not 0 <= value < 2**32 for value in raw_rng_key)
+    ):
+        raise ValueError(f"Invalid RNG transition in select line for decision {d_id}")
+    selection_sequence = raw_sequence
+    rng_key = np.asarray(raw_rng_key, dtype=np.uint32)
+    if selection_sequence > rs.snapshot_selection_sequence:
+        expected = rs.selection_sequence + 1
+        if selection_sequence != expected:
+            msg = (
+                f"WAL select for decision {d_id} has selection_sequence {selection_sequence}; "
+                f"expected {expected}"
+            )
+            raise ValueError(msg)
+        rs.rng_key = rng_key
+        rs.selection_sequence = selection_sequence
     rs.select_by_id[d_id] = entry
     if rs.ledger is not None and not rs.ledger.has_event(eid):
         rs.ledger.record(eid, entry["arm_id"], float(entry["est_units"]), float(entry["ts"]))
@@ -257,12 +313,25 @@ def replay_log(
     active_path: Path,
     rotated_path: Path | None,
     snapshot_state_version: int,
+    snapshot_selection_sequence: int,
     config: Config,
     ledger: "QuotaLedger | None" = None,
-) -> tuple[PendingStore, list[tuple[int, np.ndarray, int, float]], set[str]]:
+) -> tuple[
+    PendingStore,
+    list[tuple[int, np.ndarray, int, float]],
+    set[str],
+    np.ndarray | None,
+    int,
+]:
     """Replays the rotated then the active journal to rebuild PendingStore, the ledger events
     not yet in the snapshot, and the updates to re-apply (FR-23)."""
-    rs = _ReplayState(snapshot_state_version, ledger, config.bandit.pending_ttl_s)
+    rs = _ReplayState(
+        snapshot_state_version,
+        snapshot_selection_sequence,
+        ledger,
+        config.bandit.pending_ttl_s,
+        selection_sequence=snapshot_selection_sequence,
+    )
     retained = [p for p in (rotated_path, active_path) if p is not None and p.exists()]
     for fpath in retained:
         for entry in _read_journal(fpath):
@@ -271,4 +340,10 @@ def replay_log(
             if handler is None:
                 raise ValueError(f"WAL line with unknown phase {phase!r} in {fpath}")
             handler(entry, rs)
-    return rs.pending_store, rs.applied_reports, rs.applied_ids
+    return (
+        rs.pending_store,
+        rs.applied_reports,
+        rs.applied_ids,
+        rs.rng_key,
+        rs.selection_sequence,
+    )

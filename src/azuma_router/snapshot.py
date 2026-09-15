@@ -12,6 +12,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 from safetensors.numpy import load_file, save_file
 
 from azuma_router.config import Config
@@ -19,7 +20,7 @@ from azuma_router.errors import AzumaError, IncompatibleSnapshotError, SnapshotW
 from azuma_router.quota import QuotaLedger
 from azuma_router.state import state_from_numpy, state_to_numpy
 from azuma_router.types import BanditState, SnapshotMeta
-from azuma_router.wal import fsync_directory
+from azuma_router.wal import fsync_directory, make_private_dir, make_private_file
 
 
 def compute_config_sha256(config: Config) -> str:
@@ -59,7 +60,7 @@ def _write_snapshot_files(
     ledger: QuotaLedger,
     meta: SnapshotMeta,
 ) -> tuple[Path, int]:
-    root_dir.mkdir(parents=True, exist_ok=True)
+    make_private_dir(root_dir)
 
     tmp_dir = root_dir / "snapshot.tmp"
     target_dir = root_dir / "snapshot"
@@ -67,17 +68,19 @@ def _write_snapshot_files(
 
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    make_private_dir(tmp_dir)
 
     # 1. state.safetensors
     tensor_dict = state_to_numpy(state)
 
     tensor_path = tmp_dir / "state.safetensors"
     save_file(tensor_dict, str(tensor_path))
+    make_private_file(tensor_path)
 
     # 2. state.json
     json_path = tmp_dir / "state.json"
     json_path.write_text(json.dumps(meta.to_dict(), indent=2), encoding="utf-8")
+    make_private_file(json_path)
 
     # Calculate written bytes
     total_bytes = tensor_path.stat().st_size + json_path.stat().st_size
@@ -109,7 +112,7 @@ def _write_snapshot_files(
 def _validate_snapshot_compatibility(meta: SnapshotMeta, config: Config) -> None:
     """Performs fail-fast shape and version checks against running Config (FR-26)."""
     expected_arm_ids = [arm.arm_id for arm in config.arms]
-    if meta.schema_version != 1:
+    if meta.schema_version != 2:
         raise IncompatibleSnapshotError(f"Unsupported schema_version: {meta.schema_version}")
     if meta.featurizer_version != 1:
         msg = f"Unsupported featurizer_version: {meta.featurizer_version}"
@@ -126,6 +129,57 @@ def _validate_snapshot_compatibility(meta: SnapshotMeta, config: Config) -> None
     if meta.arm_ids != expected_arm_ids:
         msg = f"arm_ids mismatch: snapshot={meta.arm_ids}, config={expected_arm_ids}"
         raise IncompatibleSnapshotError(msg)
+    if type(meta.state_version) is not int or meta.state_version < 0:
+        raise IncompatibleSnapshotError("state_version must be a non-negative integer")
+    if type(meta.selection_sequence) is not int or meta.selection_sequence < meta.state_version:
+        raise IncompatibleSnapshotError("selection_sequence must be >= state_version")
+
+
+def _validate_tensor_schema(tensors: dict[str, np.ndarray], config: Config) -> None:
+    """Rejects a safetensors payload whose keys, shapes or dtypes are not a BanditState."""
+    k_max = config.bandit.k_max
+    d = config.bandit.d
+    schemas = {
+        "A": ((k_max, d, d), np.dtype(np.float64)),
+        "b": ((k_max, d), np.dtype(np.float64)),
+        "n_pulls": ((k_max,), np.dtype(np.int32)),
+        "mask": ((k_max,), np.dtype(bool)),
+        "rng_key": ((2,), np.dtype(np.uint32)),
+    }
+    if set(tensors) != set(schemas):
+        raise IncompatibleSnapshotError(
+            f"Snapshot tensor keys must be {sorted(schemas)}, got {sorted(tensors)}"
+        )
+    for name, (shape, dtype) in schemas.items():
+        value = tensors[name]
+        if value.shape != shape or value.dtype != dtype:
+            raise IncompatibleSnapshotError(
+                f"Invalid snapshot tensor {name}: expected {dtype}{shape}, "
+                f"got {value.dtype}{value.shape}"
+            )
+
+
+def _validate_state_tensors(tensors: dict[str, np.ndarray], config: Config) -> None:
+    """Rejects malformed or numerically invalid persisted bandit state before JAX conversion."""
+    _validate_tensor_schema(tensors, config)
+    a = tensors["A"]
+    b = tensors["b"]
+    n_pulls = tensors["n_pulls"]
+    mask = tensors["mask"]
+    if not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
+        raise IncompatibleSnapshotError("Snapshot tensors A and b must be finite")
+    if not np.array_equal(a, np.swapaxes(a, -1, -2)):
+        raise IncompatibleSnapshotError("Snapshot tensor A must be symmetric")
+    try:
+        np.linalg.cholesky(a)
+    except np.linalg.LinAlgError as err:
+        raise IncompatibleSnapshotError("Snapshot tensor A must be positive definite") from err
+    if np.any(n_pulls < 0):
+        raise IncompatibleSnapshotError("Snapshot tensor n_pulls must be non-negative")
+    active = len(config.arms)
+    expected_mask = np.array([True] * active + [False] * (config.bandit.k_max - active))
+    if not np.array_equal(mask, expected_mask):
+        raise IncompatibleSnapshotError("Snapshot tensor mask is not canonical for configured arms")
 
 
 def restore_snapshot(
@@ -189,6 +243,7 @@ def restore_snapshot(
     # A snapshot that passed the version/shape checks can still carry tensors or a ledger this
     # build cannot decode; that is an operator problem, not a traceback (P5-MF-3).
     try:
+        _validate_state_tensors(tensors, config)
         state = state_from_numpy(tensors)
         ledger = QuotaLedger.load(meta.ledger, config)
     except Exception as err:

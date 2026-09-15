@@ -50,6 +50,7 @@ from azuma_router.state import (
 )
 from azuma_router.types import (
     MAX_INT31,
+    U32,
     BanditState,
     Pending,
     RoutingRequest,
@@ -201,6 +202,7 @@ class Router:
         self.ready = False
         self.closing = False
         self.state_version = 0
+        self.selection_sequence = 0
         self.updates_since_snapshot = 0
         self.last_snapshot_ts = self.clock()
         self.last_ts = self.clock()
@@ -228,20 +230,29 @@ class Router:
             self.state = restored_state
             self.ledger = restored_ledger
             self.state_version = restored_meta.state_version
+            self.selection_sequence = restored_meta.selection_sequence
             restored_from_snapshot = True
         else:
             self._refuse_learned_journal_without_snapshot(rotated_path)
             self.state = init_state(self.config)
             self.ledger = QuotaLedger(self.config)
             self.state_version = 0
+            self.selection_sequence = 0
             restored_from_snapshot = False
 
         # 2. Replay WAL
         try:
-            p_store, applied_reports, _applied_ids = replay_log(
+            (
+                p_store,
+                applied_reports,
+                _applied_ids,
+                replayed_rng_key,
+                replayed_selection_sequence,
+            ) = replay_log(
                 active_path=self.decision_log_path,
                 rotated_path=rotated_path if rotated_path.exists() else None,
                 snapshot_state_version=self.state_version,
+                snapshot_selection_sequence=self.selection_sequence,
                 config=self.config,
                 ledger=self.ledger,
             )
@@ -260,6 +271,9 @@ class Router:
                 self.static,
             )
             self.state_version = max(self.state_version, s_ver)
+        if replayed_rng_key is not None:
+            self.state = self.state._replace(rng_key=to_jax_array(replayed_rng_key, dtype=U32))
+        self.selection_sequence = replayed_selection_sequence
 
         # 3. Open DecisionLog
         self.dlog = DecisionLog(self.decision_log_path, self.config.bandit.decision_log_max_bytes)
@@ -412,6 +426,7 @@ class Router:
         arm_i = int(arm_idx)
         chosen_arm = self.config.arms[arm_i]
         prop_val = float(propensity)
+        next_selection_sequence = self.selection_sequence + 1
         d_id = uuid7()
         est_u = float(est_units_arr[arm_i])
 
@@ -442,6 +457,8 @@ class Router:
             "est_units": est_u,
             "ledger_event_id": eid,
             "featurizer_version": FEATURIZER_VERSION,
+            "selection_sequence": next_selection_sequence,
+            "rng_key": np.asarray(state_next.rng_key, dtype=np.uint32).tolist(),
         }
         if self.dlog is not None:
             self.dlog.append(select_entry)
@@ -449,6 +466,7 @@ class Router:
         # Mutate ledger and state only AFTER WAL append succeeds
         self.ledger.record(eid, chosen_arm.arm_id, est_u, now)
         self.state = state_next
+        self.selection_sequence = next_selection_sequence
 
         pending = Pending(
             decision_id=d_id,
@@ -634,12 +652,13 @@ class Router:
         expired = self._sweep_expired(now)
 
         meta = SnapshotMeta(
-            schema_version=1,
+            schema_version=2,
             state_version=self.state_version,
             featurizer_version=FEATURIZER_VERSION,
             arm_ids=[arm.arm_id for arm in self.config.arms],
             static=self.static,
             seed=self.config.bandit.seed,
+            selection_sequence=self.selection_sequence,
             created_at=datetime.datetime.fromtimestamp(now, tz=datetime.UTC).isoformat(),
             ledger=self.ledger.dump(),
             config_sha256=compute_config_sha256(self.config),

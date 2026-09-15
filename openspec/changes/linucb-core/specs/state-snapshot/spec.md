@@ -5,7 +5,7 @@ Persistencia atómica del estado del bandido y del ledger en safetensors + JSON,
 ## ADDED Requirements
 
 ### Requirement: Escritura atómica
-`snapshot(dir, state, ledger, meta)` SHALL escribir `state.safetensors` (tensores `A`, `b`, `n_pulls`, `mask`, `rng_key`) y `state.json` (`SnapshotMeta`) en `<dir>/snapshot.tmp/`, hacer `fsync` de ambos ficheros y del directorio, y publicar mediante rename de directorio: `snapshot/ → snapshot.old/`, `snapshot.tmp/ → snapshot/`, borrar `snapshot.old/`. MUST NOT usar `pickle` (FR-25, NFR-07).
+`snapshot(dir, state, ledger, meta)` SHALL escribir `state.safetensors` (tensores `A`, `b`, `n_pulls`, `mask`, `rng_key`) y `state.json` (`SnapshotMeta`, schema 2 con `selection_sequence`) en `<dir>/snapshot.tmp/`, hacer `fsync` de ambos ficheros y del directorio, y publicar mediante rename de directorio: `snapshot/ → snapshot.old/`, `snapshot.tmp/ → snapshot/`, borrar `snapshot.old/`. El directorio de estado SHALL crearse con modo `0700` y los ficheros persistidos con `0600`; `restore` SHALL NOT alterar permisos. MUST NOT usar `pickle` (FR-25, NFR-07).
 
 #### Scenario: layout tras snapshot
 - **WHEN** se invoca `snapshot`
@@ -27,7 +27,7 @@ Persistencia atómica del estado del bandido y del ledger en safetensors + JSON,
 - **THEN** `restore` acepta el snapshot y emite `warning`
 
 ### Requirement: Round-trip bitwise
-`restore(snapshot(s)) == s` SHALL cumplirse bitwise para todos los arrays y el ledger (FR-27).
+`restore` SHALL verificar antes de convertir a JAX el conjunto exacto de tensores, sus formas y dtypes, finitud de `A`/`b`, simetría y SPD de `A`, contadores no negativos, máscara canónica y forma de `rng_key`; cualquier incumplimiento SHALL producir `IncompatibleSnapshotError`. `restore(snapshot(s)) == s` SHALL cumplirse bitwise para todos los arrays y el ledger (FR-27).
 
 #### Scenario: round-trip
 - **WHEN** se hace snapshot de un estado tras 50 updates y se restaura

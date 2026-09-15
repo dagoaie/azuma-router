@@ -58,12 +58,12 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 - **FR-20** Antes de responder a `select`, el daemon DEBE haber hecho `append + flush` de una línea `phase="select"` en el JSONL.
 - **FR-21** `report` para `decision_id` pendiente DEBE, en este orden: escribir `phase="report"`, corregir el ledger, aplicar `update`, mover a aplicado. Duplicado ⇒ `{"applied": false, "reason": "duplicate"}` sin escritura.
 - **FR-22** Pendientes con `now − ts_select > pending_ttl_s` DEBEN expirar en el barrido (inicio de `select` y `snapshot`): línea `phase="expire"`, sin `update`, consumo estimado del ledger se mantiene.
-- **FR-23** Al arrancar, el daemon DEBE reconstruir `PendingStore` por replay del JSONL (fichero activo + anterior rotado): **toda** línea `select` retenida sin `report`/`expire` posterior es un pendiente vivo, sea cual sea su `state_version` (los `select` no lo avanzan); el ledger se reconstruye de forma idempotente por `ledger_event_id` (evento ya presente en el snapshot ⇒ no se re-registra). El filtro `state_version > snapshot.state_version` aplica solo a la reaplicación de líneas `report` (FR-24). Un `report` sin `select` retenido ⇒ journal corrupto ⇒ salida código 3.
+- **FR-23** Al arrancar, el daemon DEBE reconstruir `PendingStore` por replay del JSONL (fichero activo + anterior rotado): **toda** línea `select` retenida sin `report`/`expire` posterior es un pendiente vivo, sea cual sea su `state_version` (los `select` no lo avanzan); el ledger se reconstruye de forma idempotente por `ledger_event_id` (evento ya presente en el snapshot ⇒ no se re-registra). Cada `select` persiste su `selection_sequence` y la `rng_key` posterior; el replay restaura la última transición estrictamente posterior a `SnapshotMeta.selection_sequence`, que DEBE ser contigua. El filtro `state_version > snapshot.state_version` aplica solo a la reaplicación de líneas `report` (FR-24). Un `report` sin `select` o una transición PRNG ausente/discontinua ⇒ journal corrupto ⇒ salida código 3.
 - **FR-24** `report` de `decision_id` desconocido ⇒ `-32002`; expirado ⇒ `-32003`.
 
 ### 3.7 Snapshot (ADR-0009, 0017)
-- **FR-25** `snapshot(state, ledger, meta, dir)` DEBE escribir `state.safetensors` + `state.json` en `<dir>/snapshot.tmp/`, `fsync` ambos, `fsync` del directorio, `rename` a `<dir>/snapshot/` (reemplazando el anterior de forma atómica) y `fsync` del directorio padre antes de borrar `snapshot.old/`. Cualquier excepción en cualquier paso (`OSError`, safetensors, serialización) ⇒ `snapshot_write_error`, salida código 4; nunca un `-32603` que deje al daemon sirviendo sin snapshots. `config_sha256` = SHA-256 del JSON canónico del `Config` validado completo.
-- **FR-26** `restore(dir, config) -> (state, ledger, meta)` DEBE lanzar `IncompatibleSnapshotError` si difiere cualquiera de: `schema_version`, `d`, `K_max`, `W_max`, `featurizer_version`, `arm_ids`. Nunca migrar.
+- **FR-25** `snapshot(state, ledger, meta, dir)` DEBE escribir `state.safetensors` + `state.json` en `<dir>/snapshot.tmp/`, `fsync` ambos, `fsync` del directorio, `rename` a `<dir>/snapshot/` (reemplazando el anterior de forma atómica) y `fsync` del directorio padre antes de borrar `snapshot.old/`. El directorio de estado se crea con modo `0700` y los ficheros persistidos (WAL, tensores, metadata) con `0600`; `restore` nunca altera permisos, y un fichero ilegible sigue siendo `snapshot_read_failed`. Cualquier excepción en cualquier paso (`OSError`, safetensors, serialización) ⇒ `snapshot_write_error`, salida código 4; nunca un `-32603` que deje al daemon sirviendo sin snapshots. `config_sha256` = SHA-256 del JSON canónico del `Config` validado completo.
+- **FR-26** `restore(dir, config) -> (state, ledger, meta)` DEBE lanzar `IncompatibleSnapshotError` si difiere cualquiera de: `schema_version`, `d`, `K_max`, `W_max`, `featurizer_version`, `arm_ids`; o si el conjunto, forma, dtype, finitud, simetría/SPD de `A`, contadores, máscara canónica o forma de `rng_key` no son válidos, o si `selection_sequence < state_version` (cada `update` sigue a un `select`). Nunca migrar.
 - **FR-27** `restore(snapshot(s)) == s` bitwise para todos los arrays.
 - **FR-28** El daemon DEBE hacer snapshot cuando `updates_since_snapshot ≥ 100` **o** `now − last_snapshot ≥ 30 s` (evaluado tras cada `report`) y en shutdown limpio (EOF en stdin o SIGTERM/SIGINT). Una señal recibida mientras una petición está en curso se **difiere** hasta que esa petición ha respondido (`shutdown_deferred`); nunca se hace snapshot a mitad de un `report`.
 
@@ -179,8 +179,8 @@ Pending (frozen dataclass)                    # ADR-0016
   select_entry: dict          # línea `select` del journal, arrastrada íntegra en la rotación del WAL
 
 SnapshotMeta (frozen dataclass)               # ADR-0009
-  schema_version: int (=1), state_version: int, featurizer_version: int (=1),
-  arm_ids: list[str], static: StaticConfig, seed: int, created_at: str (RFC 3339),
+  schema_version: int (=2), state_version: int, featurizer_version: int (=1),
+  arm_ids: list[str], static: StaticConfig, seed: int, selection_sequence: int, created_at: str (RFC 3339),
   ledger: LedgerDump, config_sha256: str
 ```
 
@@ -216,7 +216,8 @@ report sobre inexistente → error -32002
  "policy":[0.01,0.8123,...],               // 32 floats (0 en enmascarados)
  "score":[...],"exploit":[...],"bonus":[...],"shadow_price":[...],
   "utilization":{"gpt-5-codex@openai-codex":[0.42,0.10]},
- "est_units":2.1,"ledger_event_id":42,"featurizer_version":1}
+  "est_units":2.1,"ledger_event_id":42,"featurizer_version":1,
+  "selection_sequence":81,"rng_key":[123,456]}
 
 // phase = "report"
 {"phase":"report","decision_id":"018f...","ts":1757800012.9,"state_version":42,
@@ -325,6 +326,7 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 | `report` llega antes de que `select` haya hecho flush | Imposible: `select` responde solo tras flush (FR-20). |
 | Crash entre línea `select` y respuesta | Al arrancar, replay ve `select` sin `report`: pendiente; expirará o se reportará. |
 | Crash entre línea `report` y `update` aplicado | Replay reaplica `report` (línea existe, `state_version` del snapshot menor): `update` es idempotente por replay porque solo se reaplica si `state_version_line > snapshot.state_version`. Los `report` reaplicados DEBEN ser contiguos (`snapshot.state_version + 1, + 2, …`); un hueco ⇒ `replay_failed`, salida 3. |
+| Journal de un formato anterior (línea `select` sin `selection_sequence`/`rng_key`) | `replay_failed`, salida 3; nunca se migra. Recuperación: borrar `snapshot/` y el journal para arrancar desde el estado inicial. |
 | Excepción inesperada tras escribir la línea `report` (`ledger.correct`, `update_jit`, `pending`) | La línea ya es durable: `journal_apply_error`, salida 4 **sin** snapshot; el replay al arrancar deja memoria y journal reconciliados. |
 | Snapshot `.tmp` residual al arrancar | Se borra; se restaura `snapshot/` si existe. |
 | `snapshot/` ausente | Estado inicial (FR-07); `ready.restored_from_snapshot = false`; un `decisions.1.jsonl` presente sin `snapshot/` es inconsistente (la rotación siempre sigue a un snapshot) ⇒ `wal_inconsistent`, salida código 3; un `decisions.jsonl` sin rotar se reproduce íntegro desde el estado inicial (caso: kill antes del primer snapshot de cadencia). |
@@ -383,5 +385,5 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 - **NFR-03 Memoria**: estado ≤ 32·32·32·8 B ≈ 262 KiB por copia; el daemon retiene ≤ 2 copias (actual + snapshot en curso).
 - **NFR-04 Observabilidad**: stderr en JSON (`ts`, `level`, `event`, campos); eventos mínimos: `ready`, `snapshot_written`, `pending_expired`, `report_duplicate`, `clock_skew`, `signal_received`, `shutdown_deferred`.
 - **NFR-05 Tipado**: `mypy --strict` sin errores; `jaxtyping` NO se usa (anotaciones de forma en docstrings).
-- **NFR-06 Determinismo**: mismo `seed` + misma secuencia de peticiones y reports ⇒ mismo JSONL bitwise (excepto `ts`).
+- **NFR-06 Determinismo**: mismo `seed` + misma secuencia de peticiones y reports ⇒ mismo JSONL bitwise, excepto `ts` y `decision_id` (UUIDv7 con parte aleatoria; la correspondencia `select`↔`report` sí es idéntica).
 - **NFR-07 Seguridad**: nunca `pickle`; `safetensors` para arrays; el daemon no abre sockets.

@@ -7,12 +7,15 @@ import math
 import shutil
 import signal
 import sys
+import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
+import safetensors.numpy
 
 from azuma_router import daemon as daemon_mod
 from azuma_router.config import load_config
@@ -845,6 +848,31 @@ def test_boot_exits_3_on_an_incompatible_snapshot(
     assert "incompatible_snapshot" in events
 
 
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        pytest.param(lambda t: t["A"].__setitem__((0, 0, 0), np.nan), id="nan"),
+        pytest.param(lambda t: t["A"].__setitem__((0, 0, 0), -1.0), id="not-spd"),
+        pytest.param(lambda t: t.__setitem__("A", t["A"][:, :3, :3]), id="wrong-shape"),
+    ],
+)
+def test_boot_exits_3_on_malformed_snapshot_tensors(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    corrupt: Callable[[dict[str, np.ndarray]], None],
+) -> None:
+    """Persisted tensors that cannot be bandit state are incompatible, not a traceback (RR7-2)."""
+    tensor_path = _snapshot_meta_path(tmp_path).with_name("state.safetensors")
+    tensors = safetensors.numpy.load_file(str(tensor_path))
+    corrupt(tensors)
+    safetensors.numpy.save_file(tensors, str(tensor_path))
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "incompatible_snapshot" in events
+
+
 def test_boot_exits_3_when_the_snapshot_cannot_be_read(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -853,7 +881,7 @@ def test_boot_exits_3_when_the_snapshot_cannot_be_read(
     try:
         code, events = _boot_exit_code(tmp_path, capsys)
     finally:
-        meta_path.chmod(0o644)
+        meta_path.chmod(0o600)
 
     assert code == 3
     assert "snapshot_read_failed" in events
@@ -868,7 +896,7 @@ def test_boot_exits_3_when_the_journal_cannot_be_read(
     try:
         code, events = _boot_exit_code(tmp_path, capsys)
     finally:
-        journal.chmod(0o644)
+        journal.chmod(0o600)
 
     assert code == 3
     assert "replay_failed" in events
@@ -929,13 +957,29 @@ def test_report_on_an_evicted_expired_id_is_unknown_not_expired(tmp_path: Path) 
 
 def _normalized_journal(journal: Path) -> list[str]:
     normalized = []
+    decision_ordinals: dict[str, int] = {}
     for line in journal.read_text(encoding="utf-8").splitlines():
         data = json.loads(line)
         data["ts"] = 0.0
         data.pop("ts_select", None)
-        data["decision_id"] = "fixed-uuid"
+        data["decision_id"] = decision_ordinals.setdefault(
+            data["decision_id"], len(decision_ordinals)
+        )
         normalized.append(json.dumps(data, sort_keys=True))
     return normalized
+
+
+def test_uuid7_is_time_ordered_and_unique() -> None:
+    """decision_id is a real UUIDv7 (ADR-0011): sortable by wall time, never reused."""
+    before_ms = int(time.time() * 1000)
+    ids = [uuid.UUID(daemon_mod.uuid7()) for _ in range(64)]
+    after_ms = int(time.time() * 1000)
+
+    assert len(set(ids)) == 64
+    for uid in ids:
+        assert uid.version == 7
+        assert uid.variant == uuid.RFC_4122
+        assert before_ms <= uid.int >> 80 <= after_ms
 
 
 def test_journal_determinism_across_runs(tmp_path: Path) -> None:
@@ -948,6 +992,84 @@ def test_journal_determinism_across_runs(tmp_path: Path) -> None:
         return _normalized_journal(run_dir / "decisions.jsonl")
 
     assert run_simulation(tmp_path / "run1") == run_simulation(tmp_path / "run2")
+
+
+def test_restart_replays_rng_progression_after_a_snapshot(tmp_path: Path) -> None:
+    """A crash after durable selects continues from the same JAX key as an uninterrupted run."""
+    crashed = _booted_router(tmp_path / "crashed")
+    control = _booted_router(tmp_path / "control")
+    crashed.snapshot({})
+    control.snapshot({})
+
+    for _ in range(2):
+        crashed.select({"request": REQUEST})
+        control.select({"request": REQUEST})
+    assert crashed.dlog is not None
+    crashed.dlog.close()  # Simulate a crash: no shutdown snapshot.
+
+    restarted = _booted_router(tmp_path / "crashed")
+    recovered = restarted.select({"request": REQUEST})
+    uninterrupted = control.select({"request": REQUEST})
+
+    assert recovered["arm"] == uninterrupted["arm"]
+    np.testing.assert_array_equal(restarted.state.rng_key, control.state.rng_key)
+    restarted.close()
+    control.close()
+
+
+def test_restart_replays_rng_after_rotation_carries_old_selects(tmp_path: Path) -> None:
+    """Carried selects already included in a snapshot must not mask newer RNG transitions."""
+    crashed = _booted_router(tmp_path / "crashed", max_bytes=1)
+    control = _booted_router(tmp_path / "control", max_bytes=1)
+    crashed.select({"request": REQUEST})
+    control.select({"request": REQUEST})
+    assert (tmp_path / "crashed" / "decisions.1.jsonl").exists()
+    assert crashed.dlog is not None
+    assert control.dlog is not None
+    crashed.dlog.max_bytes = 10**9
+    control.dlog.max_bytes = 10**9
+    for _ in range(2):
+        crashed.select({"request": REQUEST})
+        control.select({"request": REQUEST})
+    crashed.dlog.close()  # Simulate a crash after post-snapshot selects.
+
+    restarted = _booted_router(tmp_path / "crashed")
+    recovered = restarted.select({"request": REQUEST})
+    uninterrupted = control.select({"request": REQUEST})
+
+    assert recovered["arm"] == uninterrupted["arm"]
+    np.testing.assert_array_equal(restarted.state.rng_key, control.state.rng_key)
+    restarted.close()
+    control.close()
+
+
+def test_persisted_router_files_are_private(tmp_path: Path) -> None:
+    router = _booted_router(tmp_path)
+    router.snapshot({})
+
+    assert (tmp_path / ".azuma").stat().st_mode & 0o777 == 0o700
+    assert (tmp_path / ".azuma" / "snapshot").stat().st_mode & 0o777 == 0o700
+    assert (tmp_path / ".azuma" / "snapshot" / "state.safetensors").stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / ".azuma" / "snapshot" / "state.json").stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "decisions.jsonl").stat().st_mode & 0o777 == 0o600
+    router.close()
+
+
+def test_wal_file_permissions_do_not_modify_an_external_parent_directory(tmp_path: Path) -> None:
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir(mode=0o755)
+    shared_dir.chmod(0o755)
+    cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
+    router = Router(
+        config=cfg,
+        snapshot_dir=tmp_path / ".azuma",
+        decision_log_path=shared_dir / "decisions.jsonl",
+    )
+    router.boot()
+
+    assert shared_dir.stat().st_mode & 0o777 == 0o755
+    assert (shared_dir / "decisions.jsonl").stat().st_mode & 0o777 == 0o600
+    router.close()
 
 
 def _select_ids(journal: Path) -> set[str]:

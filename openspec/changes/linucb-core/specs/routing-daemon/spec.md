@@ -49,7 +49,7 @@ Las peticiones SHALL procesarse una a una en orden de llegada en un único hilo;
 - **THEN** las respuestas llegan en el orden 1, 2, 3
 
 ### Requirement: Secuencia de select
-`Router.select(params)` SHALL: barrer expirados y evaluar la rotación del journal (los `expire` cuentan aunque la petición se rechace); validar `params.request` (`-32602`); featurizar (`-32001 InvalidContext` con `data.field` y `data.reason`); resolver `allowed_arms` (`-32602` con `data.field = "allowed_arms[i]"` si un id es desconocido); calcular `est_units`; construir `QuotaView`; invocar `select_jit`; si `no_arm_available`, responder `-32004` con `data.masked_reason` por brazo (`quota_exhausted | not_allowed | disabled`) sin escribir journal ni avanzar estado; en caso contrario registrar el consumo estimado, escribir la línea `select`, guardar la pendiente, avanzar `state` y responder con `decision_id`, `arm`, `propensity` y `diagnostics` (omitido si `verbose = false`). `select` SHALL verificar `isfinite(score)` sobre los brazos activos fuera del JIT y abortar con código 4 si falla.
+`Router.select(params)` SHALL: barrer expirados y evaluar la rotación del journal (los `expire` cuentan aunque la petición se rechace); validar `params.request` (`-32602`); featurizar (`-32001 InvalidContext` con `data.field` y `data.reason`); resolver `allowed_arms` (`-32602` con `data.field = "allowed_arms[i]"` si un id es desconocido); calcular `est_units`; construir `QuotaView`; invocar `select_jit`; si `no_arm_available`, responder `-32004` con `data.masked_reason` por brazo (`quota_exhausted | not_allowed | disabled`) sin escribir journal ni avanzar estado; en caso contrario registrar el consumo estimado, escribir la línea `select` con la transición PRNG posterior y secuencia contigua, guardar la pendiente, avanzar `state` y responder con `decision_id`, `arm`, `propensity` y `diagnostics` (omitido si `verbose = false`). `select` SHALL verificar `isfinite(score)` sobre los brazos activos fuera del JIT y abortar con código 4 si falla.
 
 #### Scenario: contexto inválido
 - **WHEN** `params.request.task_kind = "unknown"`
@@ -101,8 +101,8 @@ Ante EOF en `stdin`, `SIGTERM` o `SIGINT`, el daemon SHALL terminar la petición
 - **THEN** `health.ready == true`, el segundo `health.state_version == 1`, el proceso sale con código 0 y existe `snapshot/`; al relanzar, `ready.restored_from_snapshot == true` y `warmup_ms < 5000` (AC-25, NFR-02)
 
 ### Requirement: Determinismo del journal
-Con el mismo `seed` y la misma secuencia de peticiones y reports, el journal SHALL ser bitwise idéntico salvo en los campos `ts` (NFR-06).
+Con el mismo `seed` y la misma secuencia de peticiones y reports, el journal SHALL ser bitwise idéntico salvo en los campos `ts` y `decision_id` (NFR-06); la correspondencia `select`↔`report` SHALL ser la misma.
 
 #### Scenario: dos ejecuciones
 - **WHEN** se ejecuta la misma secuencia de 50 `select`/`report` en dos routers con `seed = 42`
-- **THEN** los journals coinciden línea a línea tras eliminar `ts`
+- **THEN** los journals coinciden línea a línea tras eliminar `ts` y sustituir cada `decision_id` por su ordinal de primera aparición
