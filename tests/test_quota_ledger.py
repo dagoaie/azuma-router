@@ -163,9 +163,7 @@ def test_load_restores_event_ids_and_allocator() -> None:
 @pytest.mark.parametrize(
     "mutate",
     [
-        pytest.param(
-            lambda dump: dump["events"].__setitem__("unknown", []), id="unknown-arm"
-        ),
+        pytest.param(lambda dump: dump["events"].__setitem__("unknown", []), id="unknown-arm"),
         pytest.param(
             lambda dump: dump.__setitem__("next_event_id", 1), id="allocator-not-after-events"
         ),
