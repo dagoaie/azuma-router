@@ -35,6 +35,8 @@ markers = ["bench: latency benchmarks (excluded by default)"]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+# samples/ holds deliberately seeded bugs for the review-pipeline experiment (see samples/rate-limiter/ANSWER_KEY.md)
+extend-exclude = ["samples"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "N", "ANN", "RUF"]
