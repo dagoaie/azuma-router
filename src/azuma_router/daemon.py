@@ -356,6 +356,17 @@ class Router:
             self._journal_expire(p.decision_id, p.ts_select, now)
         return expired
 
+    def _reject_if_pending_full(self) -> None:
+        """Bounds the PendingStore: unreported selects would otherwise grow memory and journal."""
+        limit = self.config.bandit.max_pending
+        pending = len(self.pending_store)
+        if pending >= limit:
+            raise RpcError(
+                -32007,
+                "Too many pending decisions",
+                data={"max_pending": limit, "pending": pending},
+            )
+
     def select(self, params: dict[str, Any]) -> dict[str, Any]:
         """Orchestrates select step (FR-20, FR-31)."""
         if not self.ready:
@@ -365,6 +376,7 @@ class Router:
         self._sweep_expired(now)
         # Expire appends count towards rotation even if this request is rejected (R4-SF-2).
         self._rotate_if_needed()
+        self._reject_if_pending_full()
 
         # Parse request
         req_raw = params.get("request")

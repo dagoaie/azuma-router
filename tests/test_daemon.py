@@ -533,6 +533,75 @@ def test_router_report_ttl_sweep_and_expired_decision_error(tmp_path: Path) -> N
     router.close()
 
 
+def _router_with_max_pending(tmp_path: Path, limit: int, clock_fn: Callable[[], float]) -> Router:
+    cfg = load_fixture_config_with(tmp_path, **{"max_pending = 10000": f"max_pending = {limit}"})
+    router = Router(
+        config=cfg,
+        snapshot_dir=tmp_path / ".azuma",
+        decision_log_path=tmp_path / "decisions.jsonl",
+        clock_fn=clock_fn,
+    )
+    router.boot()
+    return router
+
+
+def test_select_is_rejected_at_max_pending_without_touching_state_or_journal(
+    tmp_path: Path,
+) -> None:
+    router = _router_with_max_pending(tmp_path, 2, lambda: 1_000.0)
+    for _ in range(2):
+        router.select({"request": REQUEST})
+    journal_before = (tmp_path / "decisions.jsonl").read_bytes()
+    version_before = router.state_version
+
+    with pytest.raises(RpcError) as exc_info:
+        router.select({"request": REQUEST})
+
+    assert exc_info.value.code == -32007
+    assert exc_info.value.data == {"max_pending": 2, "pending": 2}
+    assert len(router.pending_store) == 2
+    assert router.state_version == version_before
+    assert (tmp_path / "decisions.jsonl").read_bytes() == journal_before
+    router.close()
+
+
+def test_select_resumes_once_a_report_frees_a_pending_slot(tmp_path: Path) -> None:
+    router = _router_with_max_pending(tmp_path, 1, lambda: 1_000.0)
+    decision_id = router.select({"request": REQUEST})["decision_id"]
+    with pytest.raises(RpcError):
+        router.select({"request": REQUEST})
+
+    router.report(_report_params(decision_id))
+
+    assert "decision_id" in router.select({"request": REQUEST})
+    router.close()
+
+
+def test_select_resumes_once_ttl_expiry_frees_a_pending_slot(tmp_path: Path) -> None:
+    clock = [1_000.0]
+    router = _router_with_max_pending(tmp_path, 1, lambda: clock[0])
+    router.select({"request": REQUEST})
+    with pytest.raises(RpcError):
+        router.select({"request": REQUEST})
+
+    clock[0] += 3601.0  # past pending_ttl_s: the sweep at the start of select expires it
+
+    assert "decision_id" in router.select({"request": REQUEST})
+    router.close()
+
+
+def test_select_before_ready_still_reports_not_ready_even_when_full(tmp_path: Path) -> None:
+    cfg = load_fixture_config_with(tmp_path, **{"max_pending = 10000": "max_pending = 1"})
+    router = Router(
+        config=cfg,
+        snapshot_dir=tmp_path / ".azuma",
+        decision_log_path=tmp_path / "decisions.jsonl",
+    )
+    with pytest.raises(RpcError) as exc_info:
+        router.select({"request": REQUEST})
+    assert exc_info.value.code == -32005
+
+
 def test_router_select_no_arm_available_preserves_state(tmp_path: Path) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     s_dir = tmp_path / ".azuma"
