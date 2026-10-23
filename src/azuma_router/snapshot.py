@@ -20,7 +20,15 @@ from azuma_router.errors import AzumaError, IncompatibleSnapshotError, SnapshotW
 from azuma_router.quota import QuotaLedger
 from azuma_router.state import state_from_numpy, state_to_numpy
 from azuma_router.types import BanditState, SnapshotMeta
-from azuma_router.wal import fsync_directory, make_private_dir, make_private_file
+from azuma_router.wal import (
+    fsync_directory,
+    make_private_dir,
+    make_private_file,
+    require_trusted_paths,
+)
+
+_META_FILE = "state.json"
+_TENSOR_FILE = "state.safetensors"
 
 
 def compute_config_sha256(config: Config) -> str:
@@ -73,12 +81,12 @@ def _write_snapshot_files(
     # 1. state.safetensors
     tensor_dict = state_to_numpy(state)
 
-    tensor_path = tmp_dir / "state.safetensors"
+    tensor_path = tmp_dir / _TENSOR_FILE
     save_file(tensor_dict, str(tensor_path))
     make_private_file(tensor_path)
 
     # 2. state.json
-    json_path = tmp_dir / "state.json"
+    json_path = tmp_dir / _META_FILE
     json_path.write_text(json.dumps(meta.to_dict(), indent=2), encoding="utf-8")
     make_private_file(json_path)
 
@@ -192,6 +200,21 @@ def restore_snapshot(
     target_dir = root_dir / "snapshot"
     old_dir = root_dir / "snapshot.old"
 
+    # Trust nothing this process is about to delete, rename or read (FR-25b)
+    require_trusted_paths(
+        [
+            root_dir,
+            tmp_dir,
+            old_dir,
+            target_dir,
+            *(
+                directory / name
+                for directory in (old_dir, target_dir)
+                for name in (_META_FILE, _TENSOR_FILE)
+            ),
+        ]
+    )
+
     # Cleanup residual tmp
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
@@ -203,8 +226,8 @@ def restore_snapshot(
     if not target_dir.exists():
         return None, None, None
 
-    json_path = target_dir / "state.json"
-    tensor_path = target_dir / "state.safetensors"
+    json_path = target_dir / _META_FILE
+    tensor_path = target_dir / _TENSOR_FILE
 
     if not json_path.exists() or not tensor_path.exists():
         msg = f"Snapshot directory {target_dir} is missing state.json or state.safetensors"

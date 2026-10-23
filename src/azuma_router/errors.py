@@ -32,6 +32,11 @@ class IncompatibleSnapshotError(AzumaError):
     """Snapshot shapes/ids differ from the running config; no migration path exists (ADR-0009)."""
 
 
+class UnsafeStateError(AzumaError):
+    """Persisted state is owned by another user or writable by group/others; it is not trusted
+    (FR-25b). Never repaired automatically: the operator decides who may have touched it."""
+
+
 class JournalWriteError(AzumaError):
     """Fatal failure writing or flushing to the decision journal (WAL)."""
 

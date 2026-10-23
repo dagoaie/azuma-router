@@ -23,3 +23,4 @@ Formato: contexto · decisión · porqué · rechazado/diferido. Un ADR por deci
 | [0017](0017-toml-config-restart.md) | `azuma.toml`; cambio de config = reinicio; snapshot rechaza brazos distintos | Q17 |
 | [0018](0018-repo-layout-ci-precommit.md) | Layout `src/`, CI matriz, pre-commit, x64 en `__init__` | Q18 |
 | [0019](0019-max-pending-bound.md) | `bandit.max_pending` acota el `PendingStore`; `select` rechaza con `-32007` | Auditoría #1 |
+| [0020](0020-state-dir-trust-check.md) | Arranque solo confía en estado propio y no escribible por terceros; verificar, no reparar | Auditoría #2 |

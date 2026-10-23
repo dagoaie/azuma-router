@@ -8,7 +8,7 @@ import math
 import os
 import stat
 from collections import OrderedDict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from io import TextIOWrapper
 from pathlib import Path
@@ -21,11 +21,12 @@ if TYPE_CHECKING:
 
 from azuma_router.config import Config
 from azuma_router.domain import Pending
-from azuma_router.errors import JournalWriteError, LedgerEventNotFoundError
+from azuma_router.errors import JournalWriteError, LedgerEventNotFoundError, UnsafeStateError
 from azuma_router.featurizer import FEATURIZER_VERSION
 
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+_GROUP_OTHER_WRITE = stat.S_IWGRP | stat.S_IWOTH
 
 
 def make_private_dir(directory: Path) -> None:
@@ -37,6 +38,26 @@ def make_private_dir(directory: Path) -> None:
 def make_private_file(file_path: Path) -> None:
     """Restricts a file this process just wrote to the owner (FR-25, RR7-4)."""
     file_path.chmod(PRIVATE_FILE_MODE)
+
+
+def require_trusted_paths(paths: Iterable[Path]) -> None:
+    """Refuses existing state owned by another user or writable by group/others (FR-25b).
+
+    Verify-only: permissions are never altered. Missing paths are skipped; symlinks are followed
+    so the check applies to what would actually be read.
+    """
+    effective_uid = os.geteuid()
+    for path in paths:
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue
+        if info.st_uid != effective_uid:
+            msg = f"{path} is owned by uid {info.st_uid}, expected {effective_uid}"
+            raise UnsafeStateError(msg)
+        if info.st_mode & _GROUP_OTHER_WRITE:
+            msg = f"{path} is writable by group or others (mode {stat.S_IMODE(info.st_mode):04o})"
+            raise UnsafeStateError(msg)
 
 
 def fsync_directory(directory: Path) -> None:
