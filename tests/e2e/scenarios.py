@@ -363,6 +363,7 @@ def run_recovery(work_dir: Path) -> RecoveryResult:
 # --------------------------------------------------------------------------- 4. hostile input
 
 LINE_LIMIT_BYTES = 1_048_576
+HEALTH_PROBE_ID = 99
 
 
 @dataclass
@@ -391,6 +392,18 @@ def _code_of(response: dict[str, Any]) -> str:
     return "duplicate" if result.get("reason") == "duplicate" else "ok"
 
 
+def served_health(response: dict[str, Any]) -> str:
+    """ "ok" only if `response` is the ready answer to the health request behind a probe."""
+    result = response.get("result")
+    if (
+        response.get("id") == HEALTH_PROBE_ID
+        and isinstance(result, dict)
+        and result.get("ready") is True
+    ):
+        return "ok"
+    return f"respuesta inesperada: {json.dumps(response)[:80]}"
+
+
 def _rpc(method: str, params: Any, request_id: int = 1) -> str:
     return json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
 
@@ -407,7 +420,7 @@ def _oversized_line_probes(daemon: DaemonProcess) -> list[Probe]:
         ("un byte por encima del límite", LINE_LIMIT_BYTES),
         ("el doble del límite", LINE_LIMIT_BYTES * 2),
     ):
-        daemon.write_raw("x" * content_bytes + "\n" + _rpc("health", {}, 99) + "\n")
+        daemon.write_raw("x" * content_bytes + "\n" + _rpc("health", {}, HEALTH_PROBE_ID) + "\n")
         rejected = daemon.read_response()
         next_request = daemon.read_response()
         probes += [
@@ -415,7 +428,7 @@ def _oversized_line_probes(daemon: DaemonProcess) -> list[Probe]:
             Probe(
                 f"Línea de más de 1 MiB ({label}): la petición siguiente se atiende",
                 "ok",
-                _code_of(next_request),
+                served_health(next_request),
             ),
         ]
     return probes

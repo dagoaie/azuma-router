@@ -92,6 +92,10 @@ class DaemonProcess:
         )
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.call_latencies_ms.setdefault(method, []).append(elapsed_ms)
+        if response.get("id") != self._next_id:
+            raise RuntimeError(
+                f"response id {response.get('id')!r} does not match request id {self._next_id}"
+            )
         if "error" in response:
             error = response["error"]
             raise RpcCallError(error["code"], error["message"], error.get("data"))

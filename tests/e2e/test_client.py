@@ -50,3 +50,16 @@ def test_a_read_timeout_kills_and_reaps_the_daemon(
     with pytest.raises(TimeoutError):
         daemon.read_response()
     assert not daemon.is_running
+
+
+def test_a_response_for_another_request_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    daemon = make_daemon(tmp_path)
+    monkeypatch.setattr(
+        DaemonProcess,
+        "call_raw",
+        lambda self, line: {"jsonrpc": "2.0", "id": 999, "result": {}},
+    )
+    with pytest.raises(RuntimeError, match="response id"):
+        daemon.call("health")
