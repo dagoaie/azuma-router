@@ -1,0 +1,597 @@
+{
+  "meta": {
+    "date": "2026-10-23",
+    "branch": "test/e2e-simulation",
+    "commit": "aabafac",
+    "dirty": false,
+    "version": "0.1.0"
+  },
+  "checks_passed": 42,
+  "checks_total": 42,
+  "metrics": {
+    "final_regret": 0.014749717000000002,
+    "optimal_rate": 0.912,
+    "reward_ratio": 0.9818703804953293,
+    "select_p99_ms": 0.4614240756927755,
+    "report_p99_ms": 0.260562501279801,
+    "throughput": 1631.05129779009
+  },
+  "checks": {
+    "learning": [
+      {
+        "statement": "El router aprende: su error (regret) cae a menos de la mitad entre el primer y el último tramo",
+        "criterion": "último tramo < 50% del primero",
+        "observed": "0.0147 frente a 0.0525",
+        "passed": true
+      },
+      {
+        "statement": "Rinde muy por encima de repartir las peticiones al azar",
+        "criterion": "error < 25% del error del azar",
+        "observed": "0.0147 frente a 0.1483 (azar)",
+        "passed": true
+      },
+      {
+        "statement": "Elige el mejor modelo en la gran mayoría de las peticiones (último tramo)",
+        "criterion": "≥ 85%",
+        "observed": "91.2%",
+        "passed": true
+      },
+      {
+        "statement": "La recompensa conseguida se acerca al máximo teórico (último tramo)",
+        "criterion": "≥ 95% del óptimo",
+        "observed": "98.2%",
+        "passed": true
+      },
+      {
+        "statement": "Aprende el mejor modelo para tareas de tipo «code_edit»",
+        "criterion": "≥ 70%",
+        "observed": "91.4%",
+        "passed": true
+      },
+      {
+        "statement": "Aprende el mejor modelo para tareas de tipo «planning»",
+        "criterion": "≥ 70%",
+        "observed": "97.2%",
+        "passed": true
+      },
+      {
+        "statement": "Aprende el mejor modelo para tareas de tipo «summarize»",
+        "criterion": "≥ 70%",
+        "observed": "98.2%",
+        "passed": true
+      },
+      {
+        "statement": "Aprende el mejor modelo para tareas de tipo «extract»",
+        "criterion": "≥ 70%",
+        "observed": "82.4%",
+        "passed": true
+      },
+      {
+        "statement": "Aprende el mejor modelo para tareas de tipo «chat»",
+        "criterion": "≥ 70%",
+        "observed": "84.4%",
+        "passed": true
+      },
+      {
+        "statement": "Responde en milisegundos: «select» (percentil 99)",
+        "criterion": "< 50 ms",
+        "observed": "0.46 ms",
+        "passed": true
+      },
+      {
+        "statement": "Responde en milisegundos: «report» (percentil 99)",
+        "criterion": "< 50 ms",
+        "observed": "0.26 ms",
+        "passed": true
+      },
+      {
+        "statement": "Parada ordenada del servicio sin errores",
+        "criterion": "código de salida 0",
+        "observed": "código 0",
+        "passed": true
+      },
+      {
+        "statement": "Al reiniciar recupera todo lo aprendido",
+        "criterion": "restaurado desde snapshot con 3000 actualizaciones",
+        "observed": "snapshot=True, actualizaciones=3000",
+        "passed": true
+      },
+      {
+        "statement": "La evaluación offline (OPE) aprovecha todas las decisiones registradas",
+        "criterion": "3000 decisiones en cada estimación",
+        "observed": "3000, 3000, 3000",
+        "passed": true
+      },
+      {
+        "statement": "La evaluación offline de la política real coincide con la recompensa ganada",
+        "criterion": "diferencia < 0.000001",
+        "observed": "0.788643 frente a 0.788643",
+        "passed": true
+      }
+    ],
+    "quota": [
+      {
+        "statement": "El mejor modelo se frena solo antes de agotar su cuota (el precio sombra sube)",
+        "criterion": "cuota sin agotar y uso del último tramo < 1/3 del primero",
+        "observed": "37 de 60 unidades; uso 42% → 4%",
+        "passed": true
+      },
+      {
+        "statement": "El tráfico se reparte hacia el siguiente mejor modelo",
+        "criterion": "modelo alternativo = qwen3-coder",
+        "observed": "qwen3-coder@openrouter",
+        "passed": true
+      },
+      {
+        "statement": "La cuota nunca se supera, ni forzando el uso",
+        "criterion": "exactamente 60 unidades consumidas",
+        "observed": "60 unidades (uso 100%)",
+        "passed": true
+      },
+      {
+        "statement": "Con la cuota agotada rechaza la petición con un motivo claro",
+        "criterion": "error -32004 «quota_exhausted»",
+        "observed": "error -32004 «quota_exhausted»",
+        "passed": true
+      }
+    ],
+    "recovery": [
+      {
+        "statement": "Caída brusca (con snapshot previo): no se pierde ninguna actualización confirmada",
+        "criterion": "300 actualizaciones y mismo reparto por modelo",
+        "observed": "300 actualizaciones; reparto idéntico=True",
+        "passed": true
+      },
+      {
+        "statement": "Caída brusca (con snapshot previo): las decisiones en vuelo se conservan y se pueden informar después",
+        "criterion": "5 decisiones pendientes, todas informadas con éxito",
+        "observed": "5 pendientes tras reiniciar; 5 informadas; versión final 305",
+        "passed": true
+      },
+      {
+        "statement": "Caída brusca (sin snapshot previo): no se pierde ninguna actualización confirmada",
+        "criterion": "150 actualizaciones y mismo reparto por modelo",
+        "observed": "150 actualizaciones; reparto idéntico=True",
+        "passed": true
+      },
+      {
+        "statement": "Caída brusca (sin snapshot previo): las decisiones en vuelo se conservan y se pueden informar después",
+        "criterion": "5 decisiones pendientes, todas informadas con éxito",
+        "observed": "5 pendientes tras reiniciar; 5 informadas; versión final 155",
+        "passed": true
+      },
+      {
+        "statement": "Usa el snapshot si existe y recupera desde el registro si no existe",
+        "criterion": "snapshot restaurado solo en el primer caso",
+        "observed": "con snapshot=True, sin snapshot=False",
+        "passed": true
+      }
+    ],
+    "hostile": [
+      {
+        "statement": "JSON malformado",
+        "criterion": "respuesta -32700",
+        "observed": "respuesta -32700",
+        "passed": true
+      },
+      {
+        "statement": "Valor NaN en el mensaje",
+        "criterion": "respuesta -32700",
+        "observed": "respuesta -32700",
+        "passed": true
+      },
+      {
+        "statement": "Petición por lotes (no soportada)",
+        "criterion": "respuesta -32600",
+        "observed": "respuesta -32600",
+        "passed": true
+      },
+      {
+        "statement": "Parámetros que no son un objeto",
+        "criterion": "respuesta -32602",
+        "observed": "respuesta -32602",
+        "passed": true
+      },
+      {
+        "statement": "Método inexistente",
+        "criterion": "respuesta -32601",
+        "observed": "respuesta -32601",
+        "passed": true
+      },
+      {
+        "statement": "Tipo de tarea desconocido",
+        "criterion": "respuesta -32001",
+        "observed": "respuesta -32001",
+        "passed": true
+      },
+      {
+        "statement": "Número de tokens negativo",
+        "criterion": "respuesta -32001",
+        "observed": "respuesta -32001",
+        "passed": true
+      },
+      {
+        "statement": "Modelo desconocido en la lista de permitidos",
+        "criterion": "respuesta -32602",
+        "observed": "respuesta -32602",
+        "passed": true
+      },
+      {
+        "statement": "Informe de una decisión que no existe",
+        "criterion": "respuesta -32002",
+        "observed": "respuesta -32002",
+        "passed": true
+      },
+      {
+        "statement": "Calidad fuera de rango (1.5)",
+        "criterion": "respuesta -32602",
+        "observed": "respuesta -32602",
+        "passed": true
+      },
+      {
+        "statement": "Coste informado en un modelo de suscripción",
+        "criterion": "respuesta -32602",
+        "observed": "respuesta -32602",
+        "passed": true
+      },
+      {
+        "statement": "Informe válido",
+        "criterion": "respuesta ok",
+        "observed": "respuesta ok",
+        "passed": true
+      },
+      {
+        "statement": "Mismo informe enviado dos veces",
+        "criterion": "respuesta duplicate",
+        "observed": "respuesta duplicate",
+        "passed": true
+      },
+      {
+        "statement": "Línea de más de 1 MiB (un byte por encima del límite): rechazada",
+        "criterion": "respuesta -32600",
+        "observed": "respuesta -32600",
+        "passed": true
+      },
+      {
+        "statement": "Línea de más de 1 MiB (un byte por encima del límite): la petición siguiente se atiende",
+        "criterion": "respuesta ok",
+        "observed": "respuesta ok",
+        "passed": true
+      },
+      {
+        "statement": "Línea de más de 1 MiB (el doble del límite): rechazada",
+        "criterion": "respuesta -32600",
+        "observed": "respuesta -32600",
+        "passed": true
+      },
+      {
+        "statement": "Línea de más de 1 MiB (el doble del límite): la petición siguiente se atiende",
+        "criterion": "respuesta ok",
+        "observed": "respuesta ok",
+        "passed": true
+      },
+      {
+        "statement": "Tras todo el abuso el servicio sigue vivo y con el estado intacto",
+        "criterion": "activo, 1 actualización, 1 decisión pendiente",
+        "observed": "activo=True, actualizaciones=1, pendientes=1",
+        "passed": true
+      }
+    ]
+  },
+  "scenarios": {
+    "learning": {
+      "rounds": 3000,
+      "alpha": 0.3,
+      "blocks": [
+        {
+          "start": 1.0,
+          "end": 500.0,
+          "mean_regret": 0.052457296666666674,
+          "optimal_rate": 0.742
+        },
+        {
+          "start": 501.0,
+          "end": 1000.0,
+          "mean_regret": 0.015355988,
+          "optimal_rate": 0.92
+        },
+        {
+          "start": 1001.0,
+          "end": 1500.0,
+          "mean_regret": 0.017106023333333335,
+          "optimal_rate": 0.9
+        },
+        {
+          "start": 1501.0,
+          "end": 2000.0,
+          "mean_regret": 0.014016213000000001,
+          "optimal_rate": 0.91
+        },
+        {
+          "start": 2001.0,
+          "end": 2500.0,
+          "mean_regret": 0.017664344666666672,
+          "optimal_rate": 0.892
+        },
+        {
+          "start": 2501.0,
+          "end": 3000.0,
+          "mean_regret": 0.014749717000000002,
+          "optimal_rate": 0.912
+        }
+      ],
+      "random_baseline_regret": 0.14831455311111114,
+      "per_task": {
+        "code_edit": {
+          "requests": 151,
+          "oracle_arm": "gpt-5-codex@openai-codex",
+          "optimal_rate": 0.9139072847682119,
+          "arm_share": {
+            "gpt-5-codex@openai-codex": 0.9139072847682119,
+            "qwen3-coder@openrouter": 0.06622516556291391,
+            "claude-haiku@anthropic": 0.019867549668874173
+          }
+        },
+        "planning": {
+          "requests": 72,
+          "oracle_arm": "gpt-5-codex@openai-codex",
+          "optimal_rate": 0.9722222222222222,
+          "arm_share": {
+            "gpt-5-codex@openai-codex": 0.9722222222222222,
+            "qwen3-coder@openrouter": 0.013888888888888888,
+            "claude-haiku@anthropic": 0.013888888888888888
+          }
+        },
+        "summarize": {
+          "requests": 113,
+          "oracle_arm": "claude-haiku@anthropic",
+          "optimal_rate": 0.9823008849557522,
+          "arm_share": {
+            "gpt-5-codex@openai-codex": 0.017699115044247787,
+            "qwen3-coder@openrouter": 0.0,
+            "claude-haiku@anthropic": 0.9823008849557522
+          }
+        },
+        "extract": {
+          "requests": 68,
+          "oracle_arm": "qwen3-coder@openrouter",
+          "optimal_rate": 0.8235294117647058,
+          "arm_share": {
+            "gpt-5-codex@openai-codex": 0.029411764705882353,
+            "qwen3-coder@openrouter": 0.8235294117647058,
+            "claude-haiku@anthropic": 0.14705882352941177
+          }
+        },
+        "chat": {
+          "requests": 96,
+          "oracle_arm": "claude-haiku@anthropic",
+          "optimal_rate": 0.84375,
+          "arm_share": {
+            "gpt-5-codex@openai-codex": 0.13541666666666666,
+            "qwen3-coder@openrouter": 0.020833333333333332,
+            "claude-haiku@anthropic": 0.84375
+          }
+        }
+      },
+      "oracle_mean_reward_last_block": 0.8135701356666667,
+      "router_mean_reward_last_block": 0.7988204186666666,
+      "latency": {
+        "select": {
+          "calls": 3000.0,
+          "p50_ms": 0.40656249984749593,
+          "p95_ms": 0.43508714843483176,
+          "p99_ms": 0.4614240756927755
+        },
+        "report": {
+          "calls": 3000.0,
+          "p50_ms": 0.1266665021830704,
+          "p95_ms": 0.14467114961007607,
+          "p99_ms": 0.260562501279801
+        }
+      },
+      "throughput_rounds_per_s": 1631.05129779009,
+      "ope": [
+        {
+          "candidate_alpha": 0.0,
+          "ips": 0.8012132669247986,
+          "dr": 0.7961478993608052,
+          "n": 3000,
+          "ess": 2759.9854361681355
+        },
+        {
+          "candidate_alpha": 0.3,
+          "ips": 0.7886426079503511,
+          "dr": 0.788146317037008,
+          "n": 3000,
+          "ess": 3000.0
+        },
+        {
+          "candidate_alpha": 1.0,
+          "ips": 0.7036952212334586,
+          "dr": 0.7168552241529258,
+          "n": 3000,
+          "ess": 1059.9567086655286
+        }
+      ],
+      "logged_mean_reward": 0.7886426079503511,
+      "graceful_exit_code": 0,
+      "restart_restored_from_snapshot": true,
+      "restart_state_version": 3000
+    },
+    "quota": {
+      "capacity_units": 60.0,
+      "rounds": 400,
+      "free_phase_codex_pulls": 37,
+      "free_phase_codex_utilization": 0.6166666746139526,
+      "codex_share_by_block": [
+        0.42,
+        0.08,
+        0.1,
+        0.04,
+        0.04,
+        0.0,
+        0.02,
+        0.04
+      ],
+      "fallback_arm": "qwen3-coder@openrouter",
+      "forced_extra_pulls": 23,
+      "total_codex_pulls": 60,
+      "final_utilization": 1.0,
+      "forced_error_code": -32004,
+      "forced_masked_reason": "quota_exhausted"
+    },
+    "recovery": {
+      "cases": [
+        {
+          "name": "con snapshot previo",
+          "acknowledged_updates": 300,
+          "pending_at_crash": 5,
+          "state_version_after_restart": 300,
+          "pending_after_restart": 5,
+          "restored_from_snapshot": true,
+          "pulls_before_crash": {
+            "gpt-5-codex@openai-codex": 128,
+            "qwen3-coder@openrouter": 46,
+            "claude-haiku@anthropic": 126
+          },
+          "pulls_after_restart": {
+            "gpt-5-codex@openai-codex": 128,
+            "qwen3-coder@openrouter": 46,
+            "claude-haiku@anthropic": 126
+          },
+          "pending_reports_applied": 5,
+          "state_version_after_pending_reports": 305
+        },
+        {
+          "name": "sin snapshot previo",
+          "acknowledged_updates": 150,
+          "pending_at_crash": 5,
+          "state_version_after_restart": 150,
+          "pending_after_restart": 5,
+          "restored_from_snapshot": false,
+          "pulls_before_crash": {
+            "gpt-5-codex@openai-codex": 64,
+            "qwen3-coder@openrouter": 22,
+            "claude-haiku@anthropic": 64
+          },
+          "pulls_after_restart": {
+            "gpt-5-codex@openai-codex": 64,
+            "qwen3-coder@openrouter": 22,
+            "claude-haiku@anthropic": 64
+          },
+          "pending_reports_applied": 5,
+          "state_version_after_pending_reports": 155
+        }
+      ]
+    },
+    "hostile": {
+      "probes": [
+        {
+          "name": "JSON malformado",
+          "expected": "-32700",
+          "observed": "-32700",
+          "passed": true
+        },
+        {
+          "name": "Valor NaN en el mensaje",
+          "expected": "-32700",
+          "observed": "-32700",
+          "passed": true
+        },
+        {
+          "name": "Petición por lotes (no soportada)",
+          "expected": "-32600",
+          "observed": "-32600",
+          "passed": true
+        },
+        {
+          "name": "Parámetros que no son un objeto",
+          "expected": "-32602",
+          "observed": "-32602",
+          "passed": true
+        },
+        {
+          "name": "Método inexistente",
+          "expected": "-32601",
+          "observed": "-32601",
+          "passed": true
+        },
+        {
+          "name": "Tipo de tarea desconocido",
+          "expected": "-32001",
+          "observed": "-32001",
+          "passed": true
+        },
+        {
+          "name": "Número de tokens negativo",
+          "expected": "-32001",
+          "observed": "-32001",
+          "passed": true
+        },
+        {
+          "name": "Modelo desconocido en la lista de permitidos",
+          "expected": "-32602",
+          "observed": "-32602",
+          "passed": true
+        },
+        {
+          "name": "Informe de una decisión que no existe",
+          "expected": "-32002",
+          "observed": "-32002",
+          "passed": true
+        },
+        {
+          "name": "Calidad fuera de rango (1.5)",
+          "expected": "-32602",
+          "observed": "-32602",
+          "passed": true
+        },
+        {
+          "name": "Coste informado en un modelo de suscripción",
+          "expected": "-32602",
+          "observed": "-32602",
+          "passed": true
+        },
+        {
+          "name": "Informe válido",
+          "expected": "ok",
+          "observed": "ok",
+          "passed": true
+        },
+        {
+          "name": "Mismo informe enviado dos veces",
+          "expected": "duplicate",
+          "observed": "duplicate",
+          "passed": true
+        },
+        {
+          "name": "Línea de más de 1 MiB (un byte por encima del límite): rechazada",
+          "expected": "-32600",
+          "observed": "-32600",
+          "passed": true
+        },
+        {
+          "name": "Línea de más de 1 MiB (un byte por encima del límite): la petición siguiente se atiende",
+          "expected": "ok",
+          "observed": "ok",
+          "passed": true
+        },
+        {
+          "name": "Línea de más de 1 MiB (el doble del límite): rechazada",
+          "expected": "-32600",
+          "observed": "-32600",
+          "passed": true
+        },
+        {
+          "name": "Línea de más de 1 MiB (el doble del límite): la petición siguiente se atiende",
+          "expected": "ok",
+          "observed": "ok",
+          "passed": true
+        }
+      ],
+      "daemon_alive_after": true,
+      "state_version_after": 1,
+      "pending_after": 1
+    }
+  }
+}

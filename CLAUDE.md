@@ -7,6 +7,8 @@ Contextual Bandit LLM Router compiled in JAX with quota-aware shadow pricing.
 - Install dependencies: `uv sync --extra dev`
 - Run unit and integration tests: `uv run pytest`
 - Run latency benchmarks: `uv run pytest -m bench`
+- Run end-to-end simulation against the real daemon (~10 s): `uv run pytest -m e2e`
+- Regenerate the sprint-delivery report: `uv run python scripts/e2e_report.py` (writes `docs/reports/e2e/<date>-e2e-report.md` + `-results.json`; earlier JSONs feed its evolution section)
 - Run linter: `uv run ruff check`
 - Run type checker: `uv run mypy src`
 - Run daemon: `uv run python -m azuma_router.daemon --config azuma.toml`
@@ -29,6 +31,9 @@ Contextual Bandit LLM Router compiled in JAX with quota-aware shadow pricing.
   - `ope.py`: Pure NumPy Off-Policy Evaluation IPS and Doubly-Robust estimators (`evaluate`)
 - `fixtures/`: Config, featurizer reference vector, WAL replay, and OPE test fixtures
 - `tests/`: Pytest test suite mirroring `src/` layout
+  - `tests/e2e/`: simulated world (`world.py`), subprocess JSON-RPC client (`client.py`), closed-loop `driver.py`, 4 `scenarios.py` (learning, quota, recovery, hostile input), acceptance criteria in `checks.py` (single source for the tests AND the report), `report.py` renderer. Excluded from the default run via the `e2e` marker.
+- `scripts/`: `e2e_report.py` entry point (thin wrapper over `tests/e2e/report.py`)
+- `docs/reports/e2e/`: dated Spanish sprint-delivery reports for client/PM; commit a new one per sprint
 - `samples/`: review-pipeline experiment with deliberately seeded bugs; excluded from Ruff
 
 ## Specs & Decisions
