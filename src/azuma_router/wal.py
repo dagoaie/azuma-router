@@ -218,25 +218,27 @@ def _reject_json_constant(name: str) -> NoReturn:
 
 
 def _read_journal(fpath: Path) -> Iterator[dict[str, Any]]:
-    """Yields parsed lines; a truncated final line is a crash artefact and is discarded (FR-24).
-    Any other malformed line, or a line that is not a JSON object, is corruption."""
+    """Streams parsed lines one at a time, so memory is bounded by the longest line, not the file.
+
+    An unterminated final line that does not parse is a crash artefact and is discarded (FR-24):
+    only the last line of a file can lack its newline. Any other malformed line, or a line that
+    is not a JSON object, is corruption."""
     with fpath.open("r", encoding="utf-8") as f:
-        lines = f.readlines()
-    for idx, line in enumerate(lines):
-        line_str = line.strip()
-        if not line_str:
-            continue
-        try:
-            entry = json.loads(line_str, parse_constant=_reject_json_constant)
-        except json.JSONDecodeError as err:
-            if idx == len(lines) - 1 and not line.endswith("\n"):
-                return
-            raise ValueError(f"WAL corrupt at line {idx + 1} in {fpath}: {err}") from err
-        except (RecursionError, ValueError) as err:
-            raise ValueError(f"WAL corrupt at line {idx + 1} in {fpath}: {err}") from err
-        if not isinstance(entry, dict):
-            raise ValueError(f"WAL corrupt at line {idx + 1} in {fpath}: not a JSON object")
-        yield entry
+        for line_number, line in enumerate(f, start=1):
+            line_str = line.strip()
+            if not line_str:
+                continue
+            try:
+                entry = json.loads(line_str, parse_constant=_reject_json_constant)
+            except json.JSONDecodeError as err:
+                if not line.endswith("\n"):
+                    return
+                raise ValueError(f"WAL corrupt at line {line_number} in {fpath}: {err}") from err
+            except (RecursionError, ValueError) as err:
+                raise ValueError(f"WAL corrupt at line {line_number} in {fpath}: {err}") from err
+            if not isinstance(entry, dict):
+                raise ValueError(f"WAL corrupt at line {line_number} in {fpath}: not a JSON object")
+            yield entry
 
 
 def _decision_id(entry: dict[str, Any]) -> str:
