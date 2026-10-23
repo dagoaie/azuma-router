@@ -759,6 +759,17 @@ class Router:
         return exit_code
 
 
+def _discard_rest_of_line(buf: Any) -> None:
+    """Consumes input up to and including the next newline (or EOF) in bounded chunks."""
+    while True:
+        chunk = buf.readline(4096)
+        if not chunk:
+            return
+        chunk_bytes = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
+        if b"\n" in chunk_bytes:
+            return
+
+
 def _read_line_bounded(stream: Any, limit: int = 1048576) -> tuple[str | None, bool]:
     """Reads line up to limit bytes from stream. Drains remainder if oversized."""
     buf = getattr(stream, "buffer", stream)
@@ -768,13 +779,10 @@ def _read_line_bounded(stream: Any, limit: int = 1048576) -> tuple[str | None, b
             return None, False
         raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
         if len(raw_bytes) > limit:
-            while True:
-                chunk = buf.readline(4096)
-                if not chunk:
-                    break
-                chunk_bytes = chunk.encode("utf-8") if isinstance(chunk, str) else chunk
-                if b"\n" in chunk_bytes:
-                    break
+            # A line whose terminator is the byte past the limit is already fully consumed;
+            # draining again would discard the next request.
+            if not raw_bytes.endswith(b"\n"):
+                _discard_rest_of_line(buf)
             return None, True
         return raw_bytes.decode("utf-8", errors="replace"), False
     else:
@@ -893,7 +901,7 @@ def _handle_request(
     except Exception as err:
         _log_event(stderr, "error", "unhandled_error", error=str(err))
         if not is_notification:
-            _write_response(stdout, _error_response(req_id, -32603, f"Internal error: {err}"))
+            _write_response(stdout, _error_response(req_id, -32603, "Internal error"))
 
 
 class ShutdownCoordinator:

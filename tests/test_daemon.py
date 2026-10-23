@@ -590,6 +590,45 @@ def test_router_snapshot_before_ready_and_bounded_framing(tmp_path: Path) -> Non
     assert is_over2 is False
 
 
+FRAMING_LIMIT = 1048576
+
+
+@pytest.mark.parametrize(
+    "content_bytes",
+    [FRAMING_LIMIT, FRAMING_LIMIT + 1, 2 * FRAMING_LIMIT],
+    ids=["terminator_is_limit_plus_one", "newline_not_yet_read", "far_over_limit"],
+)
+def test_read_line_bounded_oversized_line_never_swallows_next_request(content_bytes: int) -> None:
+    """Whatever byte the limit lands on, only the oversized line is dropped (security audit #3)."""
+    next_request = b'{"jsonrpc":"2.0","id":1,"method":"health"}\n'
+    stream = io.BytesIO(b"x" * content_bytes + b"\n" + next_request)
+
+    line_str, is_over = _read_line_bounded(stream, limit=FRAMING_LIMIT)
+    assert (line_str, is_over) == (None, True)
+
+    line_str, is_over = _read_line_bounded(stream, limit=FRAMING_LIMIT)
+    assert (line_str, is_over) == (next_request.decode(), False)
+
+
+def test_read_line_bounded_accepts_line_whose_terminator_fits_the_limit() -> None:
+    next_request = b'{"jsonrpc":"2.0","id":1,"method":"health"}\n'
+    stream = io.BytesIO(b"x" * (FRAMING_LIMIT - 1) + b"\n" + next_request)
+
+    line_str, is_over = _read_line_bounded(stream, limit=FRAMING_LIMIT)
+    assert line_str == "x" * (FRAMING_LIMIT - 1) + "\n"
+    assert is_over is False
+
+    line_str, is_over = _read_line_bounded(stream, limit=FRAMING_LIMIT)
+    assert (line_str, is_over) == (next_request.decode(), False)
+
+
+def test_read_line_bounded_oversized_last_line_without_terminator_reports_eof_next() -> None:
+    stream = io.BytesIO(b"x" * (2 * FRAMING_LIMIT))
+
+    assert _read_line_bounded(stream, limit=FRAMING_LIMIT) == (None, True)
+    assert _read_line_bounded(stream, limit=FRAMING_LIMIT) == (None, False)
+
+
 def test_router_stderr_json_logging(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     cfg = load_config(Path("fixtures/config/azuma.valid.toml"))
     curr_time = 1000.0
