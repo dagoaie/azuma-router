@@ -41,7 +41,7 @@ Contextual Bandit LLM Router compiled in JAX with quota-aware shadow pricing.
 - `openspec/specs/<capability>/spec.md`: the 9 current capability specs (featurizer, journal, LinUCB, OPE, quota, reward, config, daemon, snapshot)
 - `openspec/changes/archive/2026-09-15-linucb-core/`: `proposal.md`, `design.md` (D1–D18, follow-ups F1–F14), `tasks.md`
 - `docs/contracts/linucb-core.md`: normative contract (FR/AC numbering)
-- `docs/adr/0001…0018`: architecture decisions, indexed in `docs/adr/README.md`
+- `docs/adr/0001…0020`: architecture decisions, indexed in `docs/adr/README.md`
 - `CONTEXT.md`: domain glossary; all names in code, tests and docs must match it
 - `proposal/tier-a/`: executed change plan and proposal
 
