@@ -14,7 +14,7 @@ Contextual Bandit LLM Router compiled in JAX with quota-aware shadow pricing.
 ## Project Structure
 
 - `src/azuma_router/`: Package source
-  - `errors.py`: Domain exception hierarchy (`AzumaError`, `ConfigError`, `InvalidContextError`, `IncompatibleSnapshotError`, `RpcError`)
+  - `errors.py`: Domain exception hierarchy (`AzumaError`, `ConfigError`, `InvalidContextError`, `IncompatibleSnapshotError`, `UnsafeStateError`, `RpcError`)
   - `domain.py`: JAX-free domain enums (`TaskKind`, `Priority`) and frozen dataclasses (`RoutingRequest`, `StaticConfig`, `Pending`, `SnapshotMeta`) — MUST NOT import jax; this is the OPE import boundary (FR-34, JAX-1)
   - `types.py`: re-exports `domain.py` for the JAX path's convenience, plus NamedTuples (`BanditState`, `QuotaView`, `Diagnostics`) and float64/int32/uint32 dtypes; imports `jax`
   - `config.py`: Strict TOML parser (`load_config`) and static config projection (`to_static_config`)

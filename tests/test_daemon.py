@@ -1087,6 +1087,34 @@ def test_boot_exits_3_on_recursively_nested_journal_json(
     assert "replay_failed" in events
 
 
+@pytest.mark.parametrize("journal_name", ["decisions.jsonl", "decisions.1.jsonl"])
+def test_boot_exits_3_on_a_group_writable_journal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], journal_name: str
+) -> None:
+    """Another user could have forged decisions the replay would feed into the bandit (FR-25b)."""
+    journal = tmp_path / journal_name
+    journal.write_text("")
+    journal.chmod(0o666)
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "unsafe_state_permissions" in events
+    assert journal.stat().st_mode & 0o777 == 0o666  # verified, never repaired
+
+
+def test_boot_exits_3_on_a_world_writable_snapshot_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    snapshot_dir = _snapshot_meta_path(tmp_path).parent
+    snapshot_dir.chmod(0o777)
+
+    code, events = _boot_exit_code(tmp_path, capsys)
+
+    assert code == 3
+    assert "unsafe_state_permissions" in events
+
+
 def test_fresh_boot_creates_the_state_directory_private_under_a_permissive_umask(
     tmp_path: Path,
 ) -> None:

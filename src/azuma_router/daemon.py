@@ -32,6 +32,7 @@ from azuma_router.errors import (
     NumericalIntegrityError,
     RpcError,
     SnapshotWriteError,
+    UnsafeStateError,
 )
 from azuma_router.featurizer import FEATURIZER_VERSION, featurize
 from azuma_router.linucb import _compile_count, select_jit, update_jit
@@ -56,7 +57,7 @@ from azuma_router.types import (
     RoutingRequest,
     SnapshotMeta,
 )
-from azuma_router.wal import DecisionLog, PendingStore, replay_log
+from azuma_router.wal import DecisionLog, PendingStore, replay_log, require_trusted_paths
 
 
 def uuid7() -> str:
@@ -217,9 +218,12 @@ class Router:
         r_name = f"{self.decision_log_path.stem}.1{self.decision_log_path.suffix}"
         rotated_path = self.decision_log_path.with_name(r_name)
 
-        # 1. Restore snapshot or clean init
+        # 1. Restore snapshot or clean init (nothing foreign-owned or group/world-writable is read)
         try:
+            require_trusted_paths([self.decision_log_path, rotated_path])
             res_snap = restore_snapshot(self.snapshot_dir, self.config)
+        except UnsafeStateError as err:
+            _exit_unrecoverable(self, "unsafe_state_permissions", err)
         except IncompatibleSnapshotError as err:
             _exit_unrecoverable(self, "incompatible_snapshot", err)
         except OSError as err:
