@@ -29,6 +29,16 @@ Contextual Bandit LLM Router compiled in JAX with quota-aware shadow pricing.
   - `ope.py`: Pure NumPy Off-Policy Evaluation IPS and Doubly-Robust estimators (`evaluate`)
 - `fixtures/`: Config, featurizer reference vector, WAL replay, and OPE test fixtures
 - `tests/`: Pytest test suite mirroring `src/` layout
+- `samples/`: review-pipeline experiment with deliberately seeded bugs; excluded from Ruff
+
+## Specs & Decisions
+
+- `openspec/specs/<capability>/spec.md`: the 9 current capability specs (featurizer, journal, LinUCB, OPE, quota, reward, config, daemon, snapshot)
+- `openspec/changes/archive/2026-09-15-linucb-core/`: `proposal.md`, `design.md` (D1–D18, follow-ups F1–F14), `tasks.md`
+- `docs/contracts/linucb-core.md`: normative contract (FR/AC numbering)
+- `docs/adr/0001…0018`: architecture decisions, indexed in `docs/adr/README.md`
+- `CONTEXT.md`: domain glossary; all names in code, tests and docs must match it
+- `proposal/tier-a/`: executed change plan and proposal
 
 ## Code Style & Guardrails
 
