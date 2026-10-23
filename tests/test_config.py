@@ -43,6 +43,7 @@ def test_load_valid_config() -> None:
         ("huge_units_coefficient.toml", "arms[0].units_per_request"),
         ("tiny_tau.toml", "bandit.tau"),
         ("huge_capacity.toml", "arms[0].windows[0].capacity"),
+        ("bad_max_pending.toml", "bandit.max_pending"),
     ],
 )
 def test_invalid_configs(filename: str, expected_field: str) -> None:
@@ -50,6 +51,19 @@ def test_invalid_configs(filename: str, expected_field: str) -> None:
     with pytest.raises(ConfigError) as exc_info:
         load_config(path)
     assert expected_field in exc_info.value.field
+
+
+def test_max_pending_is_read_from_the_bandit_section() -> None:
+    assert load_config(Path("fixtures/config/azuma.valid.toml")).bandit.max_pending == 10000
+
+
+def test_max_pending_is_required(tmp_path: Path) -> None:
+    toml = Path("fixtures/config/azuma.valid.toml").read_text(encoding="utf-8")
+    path = tmp_path / "azuma.toml"
+    path.write_text(toml.replace("max_pending = 10000\n", ""), encoding="utf-8")
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(path)
+    assert "bandit.max_pending" in exc_info.value.field
 
 
 def test_to_static_config_padding() -> None:

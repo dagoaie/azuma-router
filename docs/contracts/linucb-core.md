@@ -58,6 +58,7 @@ Plugin TS de Convoy; LinUCB hybrid; Thompson Sampling; embeddings en el featuriz
 - **FR-20** Antes de responder a `select`, el daemon DEBE haber hecho `append + flush` de una línea `phase="select"` en el JSONL.
 - **FR-21** `report` para `decision_id` pendiente DEBE, en este orden: escribir `phase="report"`, corregir el ledger, aplicar `update`, mover a aplicado. Antes de publicar cualquier snapshot, el WAL DEBE hacer `flush + fsync`, para que un snapshot durable no pueda contener un `report` ausente del journal. Duplicado ⇒ `{"applied": false, "reason": "duplicate"}` sin escritura.
 - **FR-22** Pendientes con `now − ts_select > pending_ttl_s` DEBEN expirar en el barrido (inicio de `select` y `snapshot`): línea `phase="expire"`, sin `update`, consumo estimado del ledger se mantiene.
+- **FR-22b** `select` DEBE rechazar con `-32007 TooManyPending` (`data.max_pending`, `data.pending`) cuando, tras el barrido de FR-22, el número de pendientes ya es `≥ bandit.max_pending`, sin escribir journal ni avanzar estado (ADR-0019). Un `report` o una expiración libera hueco; el replay NO descarta pendientes aunque excedan el límite configurado.
 - **FR-23** Al arrancar, el daemon DEBE reconstruir `PendingStore` por replay del JSONL (fichero activo + anterior rotado): **toda** línea `select` retenida sin `report`/`expire` posterior es un pendiente vivo, sea cual sea su `state_version` (los `select` no lo avanzan); el ledger se reconstruye de forma idempotente por `ledger_event_id` (evento ya presente en el snapshot ⇒ no se re-registra). Cada `select` persiste su `selection_sequence` y la `rng_key` posterior; el replay restaura la última transición estrictamente posterior a `SnapshotMeta.selection_sequence`, que DEBE ser contigua. El filtro `state_version > snapshot.state_version` aplica solo a la reaplicación de líneas `report` (FR-24), pero un `report` emparejado con un `select` posterior al snapshot DEBE tener también una versión posterior; de lo contrario es corrupción. Cada línea se valida contra su esquema antes de mutar estado (tipos, finitud, `x` de dimensión `d`, `arm_index` ligado a `arm_id` de la config, `propensity ∈ (0, 1]`, `reward ∈ [0, 1]`, unidades `≥ 0`, `NaN`/`Infinity` rechazados), y un `select` duplicado solo es válido si es la copia idéntica arrastrada por rotación; una segunda fase terminal para la misma decisión es corrupción. Un `report`/`expire` sin `select`, una transición PRNG ausente/discontinua o cualquier campo inválido ⇒ journal corrupto ⇒ `replay_failed`, salida código 3 (nunca una traza).
   Para un `select` posterior al snapshot, `state_version` DEBE ser igual a la versión del snapshot más los `report` posteriores ya encontrados; cualquier discrepancia es corrupción.
 - **FR-24** `report` de `decision_id` desconocido ⇒ `-32002`; expirado ⇒ `-32003`.
@@ -102,6 +103,7 @@ w_latency         = 0.2                 # float ≥ 0
 cost_budget_usd   = 0.50                # float > 0; coste que normaliza a 1
 latency_budget_s  = 30.0                # float > 0
 pending_ttl_s     = 3600                # int > 0
+max_pending       = 10000               # int > 0; select rechaza con -32007 al alcanzarlo
 snapshot_dir      = "./.azuma"          # str; se crea si no existe
 snapshot_every_updates = 100            # int > 0
 snapshot_every_s       = 30             # int > 0
@@ -267,7 +269,7 @@ Framing: UTF-8, un objeto JSON por línea terminada en `\n`, sin `Content-Length
   }
 }}
 ```
-Errores: `-32602` (params inválidos, con `data.field`), `-32001 InvalidContext` (`data.field`, `data.reason`), `-32004 NoArmAvailable` (`data.masked_reason` por brazo: `"quota_exhausted" | "not_allowed" | "disabled"`), `-32005 NotReady`.
+Errores: `-32602` (params inválidos, con `data.field`), `-32001 InvalidContext` (`data.field`, `data.reason`), `-32004 NoArmAvailable` (`data.masked_reason` por brazo: `"quota_exhausted" | "not_allowed" | "disabled"`), `-32005 NotReady`, `-32007 TooManyPending` (`data.max_pending`, `data.pending`).
 
 ### 5.3 `report`
 ```jsonc
@@ -309,6 +311,7 @@ Validación: `quality ∈ [0,1]` obligatoria; `cost_usd ≥ 0`, `latency_s ≥ 0
 | −32003 | DecisionExpired | |
 | −32004 | NoArmAvailable | |
 | −32005 | NotReady | antes de `ready` |
+| −32007 | TooManyPending | `select` con `max_pending` pendientes; `data.max_pending`, `data.pending` |
 | −32006 | IncompatibleSnapshot | solo en arranque; el daemon escribe `incompatible_snapshot` en stderr y sale con código 3 |
 
 ---

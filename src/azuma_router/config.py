@@ -65,6 +65,7 @@ class BanditConfig:
     cost_budget_usd: float
     latency_budget_s: float
     pending_ttl_s: int
+    max_pending: int
     snapshot_dir: str
     snapshot_every_updates: int
     snapshot_every_s: int
@@ -171,6 +172,10 @@ def _parse_bandit_config(b_data: dict[str, Any]) -> BanditConfig:
     if pending_ttl_s <= 0:
         raise ConfigError("bandit.pending_ttl_s", "pending_ttl_s must be > 0")
 
+    max_pending = req_b("max_pending", int)
+    if max_pending <= 0:
+        raise ConfigError("bandit.max_pending", "max_pending must be > 0")
+
     snapshot_dir = req_b("snapshot_dir", str)
     snapshot_every_updates = req_b("snapshot_every_updates", int)
     if snapshot_every_updates <= 0:
@@ -200,6 +205,7 @@ def _parse_bandit_config(b_data: dict[str, Any]) -> BanditConfig:
         cost_budget_usd=cost_budget_usd,
         latency_budget_s=latency_budget_s,
         pending_ttl_s=pending_ttl_s,
+        max_pending=max_pending,
         snapshot_dir=snapshot_dir,
         snapshot_every_updates=snapshot_every_updates,
         snapshot_every_s=snapshot_every_s,
