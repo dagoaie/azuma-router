@@ -28,8 +28,11 @@ packages = ["src/azuma_router"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not bench' -q"
-markers = ["bench: latency benchmarks (excluded by default)"]
+addopts = "-m 'not bench and not e2e' -q"
+markers = [
+    "bench: latency benchmarks (excluded by default)",
+    "e2e: end-to-end simulation against the real daemon (excluded by default)",
+]
 
 [tool.ruff]
 line-length = 100
