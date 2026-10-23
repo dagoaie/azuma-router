@@ -1,8 +1,8 @@
 {
   "meta": {
     "date": "2026-10-23",
-    "branch": "test/e2e-simulation",
-    "commit": "aabafac",
+    "branch": "fix/e2e-max-pending",
+    "commit": "ddd63ce",
     "dirty": false,
     "version": "0.1.0"
   },
@@ -12,9 +12,9 @@
     "final_regret": 0.014749717000000002,
     "optimal_rate": 0.912,
     "reward_ratio": 0.9818703804953293,
-    "select_p99_ms": 0.4614240756927755,
-    "report_p99_ms": 0.260562501279801,
-    "throughput": 1631.05129779009
+    "select_p99_ms": 0.4729596732067875,
+    "report_p99_ms": 0.27905666764085574,
+    "throughput": 1643.8537357363468
   },
   "checks": {
     "learning": [
@@ -75,13 +75,13 @@
       {
         "statement": "Responde en milisegundos: «select» (percentil 99)",
         "criterion": "< 50 ms",
-        "observed": "0.46 ms",
+        "observed": "0.47 ms",
         "passed": true
       },
       {
         "statement": "Responde en milisegundos: «report» (percentil 99)",
         "criterion": "< 50 ms",
-        "observed": "0.26 ms",
+        "observed": "0.28 ms",
         "passed": true
       },
       {
@@ -378,18 +378,18 @@
       "latency": {
         "select": {
           "calls": 3000.0,
-          "p50_ms": 0.40656249984749593,
-          "p95_ms": 0.43508714843483176,
-          "p99_ms": 0.4614240756927755
+          "p50_ms": 0.4037710023112595,
+          "p95_ms": 0.4383791485452093,
+          "p99_ms": 0.4729596732067875
         },
         "report": {
           "calls": 3000.0,
-          "p50_ms": 0.1266665021830704,
-          "p95_ms": 0.14467114961007607,
-          "p99_ms": 0.260562501279801
+          "p50_ms": 0.12250000145286322,
+          "p95_ms": 0.14237704999686684,
+          "p99_ms": 0.27905666764085574
         }
       },
-      "throughput_rounds_per_s": 1631.05129779009,
+      "throughput_rounds_per_s": 1643.8537357363468,
       "ope": [
         {
           "candidate_alpha": 0.0,
