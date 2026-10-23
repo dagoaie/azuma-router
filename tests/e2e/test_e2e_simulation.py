@@ -1,8 +1,9 @@
 """End-to-end simulation: the real daemon, over stdio, against a simulated world.
 
 Excluded from the default run (`-m e2e` selects it). The acceptance criteria live in
-`e2e.checks` and the same scenarios feed `scripts/e2e_report.py`, so every figure in a delivery
-report is a figure asserted here.
+`e2e.checks` and the same scenarios feed `scripts/e2e_report.py`: every pass/fail claim in a
+delivery report is a criterion asserted here. Other figures (throughput, OPE, per-block tables)
+are descriptive measurements without a threshold.
 """
 
 import pytest

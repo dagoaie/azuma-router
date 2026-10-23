@@ -177,6 +177,32 @@ class TestRenderReport:
         assert "mejora" in text
         assert "`old0001`" in text
 
+    def test_summary_never_claims_success_for_a_scenario_whose_checks_failed(self) -> None:
+        results = make_results()
+        broken = dataclasses.replace(results.quota, total_codex_pulls=61)
+        text = report.render_report(META, dataclasses.replace(results, quota=broken), [])
+        summary = text.split("## Resumen ejecutivo", 1)[1].split("## Qué se ha probado", 1)[0]
+        assert "nunca la supera" not in summary
+        assert "❌ **Respeta la cuota:**" in summary
+        assert "**Aprende:**" in summary
+
+    def test_summary_claims_all_four_strengths_when_everything_passes(self) -> None:
+        text = report.render_report(META, make_results(), history=[])
+        summary = text.split("## Resumen ejecutivo", 1)[1].split("## Qué se ha probado", 1)[0]
+        for claim in ("**Aprende:**", "**Respeta la cuota:**", "**Resiste caídas:**"):
+            assert claim in summary
+        assert "**Resiste entradas hostiles:**" in summary
+        assert "❌" not in summary
+
+    def test_report_does_not_promise_internal_error_sanitising_it_cannot_probe(self) -> None:
+        text = report.render_report(META, make_results(), history=[])
+        assert "ya no revelan detalles" not in text
+        assert "tests/test_jsonrpc_loop.py" in text
+
+    def test_report_separates_pass_fail_criteria_from_descriptive_figures(self) -> None:
+        text = report.render_report(META, make_results(), history=[])
+        assert "mediciones descriptivas" in text
+
     def test_dirty_tree_is_disclosed_in_the_header(self) -> None:
         text = report.render_report(dataclasses.replace(META, dirty=True), make_results(), [])
         assert "con cambios sin confirmar" in text
@@ -205,3 +231,19 @@ class TestPersistence:
             ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.startswith("| 2026-")
         ]
         assert len(rows) == 1
+
+    def test_history_omits_later_runs_so_a_backfill_never_compares_against_the_future(
+        self, tmp_path: Path
+    ) -> None:
+        for day in ("2026-10-24", "2026-10-01"):
+            report.write_report(tmp_path, dataclasses.replace(META, date=day), make_results())
+        history = report.load_history(tmp_path, exclude_date="2026-10-23")
+        assert [entry.date for entry in history] == ["2026-10-01"]
+
+    def test_history_orders_by_recorded_date_not_by_file_name(self, tmp_path: Path) -> None:
+        for day in ("2026-10-01", "2026-10-10"):
+            report.write_report(tmp_path, dataclasses.replace(META, date=day), make_results())
+        early = tmp_path / "2026-10-01-results.json"
+        early.rename(tmp_path / "zzz-results.json")
+        history = report.load_history(tmp_path, exclude_date="2026-10-23")
+        assert [entry.date for entry in history] == ["2026-10-01", "2026-10-10"]

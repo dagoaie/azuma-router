@@ -16,7 +16,7 @@ from azuma_router.config import load_config, to_static_config
 from azuma_router.ope import evaluate
 from e2e import world
 from e2e.client import DaemonProcess, RpcCallError
-from e2e.driver import RoundRecord, report_params, route_and_report, start_daemon
+from e2e.driver import RoundRecord, report_params, route_and_report, running_daemon
 
 LEARNING_ROUNDS = 3000
 LEARNING_BLOCKS = 6
@@ -139,14 +139,15 @@ def run_learning(
     work_dir: Path, rounds: int = LEARNING_ROUNDS, alpha: float = 0.3
 ) -> LearningResult:
     """Routes mixed traffic with unlimited quota; checks learning, speed, OPE and restart."""
-    daemon, _ = start_daemon(work_dir, alpha=alpha, codex_window_capacity=UNLIMITED_QUOTA)
+    config = {"alpha": alpha, "codex_window_capacity": UNLIMITED_QUOTA}
     requests = world.make_traffic(np.random.default_rng(7), rounds)
-    records = run_rounds(daemon, requests, np.random.default_rng(8))
-    latency = latency_summary(daemon)
-    elapsed_s = sum(sum(v) for v in daemon.call_latencies_ms.values()) / 1000.0
-    exit_code = daemon.terminate()
-    restarted, ready = start_daemon(work_dir, alpha=alpha, codex_window_capacity=UNLIMITED_QUOTA)
-    restarted.terminate()
+    with running_daemon(work_dir, **config) as (daemon, _):
+        records = run_rounds(daemon, requests, np.random.default_rng(8))
+        latency = latency_summary(daemon)
+        elapsed_s = sum(sum(v) for v in daemon.call_latencies_ms.values()) / 1000.0
+        exit_code = daemon.terminate()
+    with running_daemon(work_dir, **config) as (restarted, ready):
+        restarted.terminate()
     last_block = records[-(rounds // LEARNING_BLOCKS) :]
     return LearningResult(
         rounds=rounds,
@@ -214,17 +215,17 @@ def _dominant_arm(records: list[RoundRecord]) -> str:
 
 def run_quota(work_dir: Path) -> QuotaResult:
     """Only the best code arm (codex) has a small quota: it is throttled, then hard-capped."""
-    daemon, _ = start_daemon(work_dir, codex_window_capacity=QUOTA_CAPACITY)
     requests = world.make_traffic(np.random.default_rng(11), QUOTA_ROUNDS, only="code_edit")
     env = np.random.default_rng(12)
-    records = run_rounds(daemon, requests, env)
-    free_pulls, free_utilization = _codex_health(daemon)
     surplus = world.make_traffic(
         np.random.default_rng(13), int(QUOTA_CAPACITY) * 2, only="code_edit"
     )
-    extra, code, reason = _drain_codex(daemon, surplus, env)
-    total_pulls, final_utilization = _codex_health(daemon)
-    daemon.terminate()
+    with running_daemon(work_dir, codex_window_capacity=QUOTA_CAPACITY) as (daemon, _):
+        records = run_rounds(daemon, requests, env)
+        free_pulls, free_utilization = _codex_health(daemon)
+        extra, code, reason = _drain_codex(daemon, surplus, env)
+        total_pulls, final_utilization = _codex_health(daemon)
+        daemon.terminate()
     return QuotaResult(
         capacity_units=QUOTA_CAPACITY,
         rounds=QUOTA_ROUNDS,
@@ -284,35 +285,48 @@ def _leave_pending(
     return pending
 
 
+RECOVERY_CONFIG = {
+    "codex_window_capacity": UNLIMITED_QUOTA,
+    "snapshot_every_updates": NO_CADENCE_SNAPSHOT,
+}
+
+
+def _run_until_crash(
+    work_dir: Path,
+    traffic: list[world.SimRequest],
+    env: np.random.Generator,
+    *,
+    snapshot_after: int | None,
+    rounds: int,
+) -> tuple[list[tuple[str, world.SimRequest, str]], dict[str, int]]:
+    """Serves `rounds` acknowledged rounds, leaves the rest pending, then SIGKILLs the daemon."""
+    with running_daemon(work_dir, **RECOVERY_CONFIG) as (daemon, _):
+        if snapshot_after is not None:
+            run_rounds(daemon, traffic[:snapshot_after], env)
+            daemon.call("snapshot")
+            run_rounds(daemon, traffic[snapshot_after:rounds], env)
+        else:
+            run_rounds(daemon, traffic[:rounds], env)
+        left_pending = _leave_pending(daemon, traffic[rounds:])
+        pulls_before = _pulls(daemon.call("health"))
+        daemon.kill()
+    return left_pending, pulls_before
+
+
 def _crash_and_recover(
     work_dir: Path, name: str, *, snapshot_after: int | None, rounds: int, pending: int
 ) -> RecoveryCase:
-    daemon, _ = start_daemon(
-        work_dir,
-        codex_window_capacity=UNLIMITED_QUOTA,
-        snapshot_every_updates=NO_CADENCE_SNAPSHOT,
-    )
     traffic = world.make_traffic(np.random.default_rng(21), rounds + pending)
     env = np.random.default_rng(22)
-    if snapshot_after is not None:
-        run_rounds(daemon, traffic[:snapshot_after], env)
-        daemon.call("snapshot")
-        run_rounds(daemon, traffic[snapshot_after:rounds], env)
-    else:
-        run_rounds(daemon, traffic[:rounds], env)
-    left_pending = _leave_pending(daemon, traffic[rounds:])
-    pulls_before = _pulls(daemon.call("health"))
-    daemon.kill()
-    revived, ready = start_daemon(
-        work_dir,
-        codex_window_capacity=UNLIMITED_QUOTA,
-        snapshot_every_updates=NO_CADENCE_SNAPSHOT,
+    left_pending, pulls_before = _run_until_crash(
+        work_dir, traffic, env, snapshot_after=snapshot_after, rounds=rounds
     )
-    pulls_after = _pulls(revived.call("health"))
-    for decision_id, request, arm in left_pending:
-        revived.call("report", report_params(decision_id, world.observe(arm, request, env)))
-    final = revived.call("health")
-    revived.terminate()
+    with running_daemon(work_dir, **RECOVERY_CONFIG) as (revived, ready):
+        pulls_after = _pulls(revived.call("health"))
+        for decision_id, request, arm in left_pending:
+            revived.call("report", report_params(decision_id, world.observe(arm, request, env)))
+        final = revived.call("health")
+        revived.terminate()
     return RecoveryCase(
         name=name,
         acknowledged_updates=rounds,
@@ -467,13 +481,13 @@ def _report_validation_probes(daemon: DaemonProcess, request: world.SimRequest) 
 
 def run_hostile_input(work_dir: Path) -> HostileResult:
     """Throws malformed, invalid and abusive input at the daemon; it must keep serving."""
-    daemon, _ = start_daemon(work_dir, codex_window_capacity=UNLIMITED_QUOTA)
     request = world.make_traffic(np.random.default_rng(31), 1, only="chat")[0]
-    probes = _protocol_probes(daemon, request)
-    probes += _report_validation_probes(daemon, request)
-    probes += _oversized_line_probes(daemon)
-    health = daemon.call("health")
-    daemon.terminate()
+    with running_daemon(work_dir, codex_window_capacity=UNLIMITED_QUOTA) as (daemon, _):
+        probes = _protocol_probes(daemon, request)
+        probes += _report_validation_probes(daemon, request)
+        probes += _oversized_line_probes(daemon)
+        health = daemon.call("health")
+        daemon.terminate()
     return HostileResult(
         probes=probes,
         daemon_alive_after=bool(health["ready"]),

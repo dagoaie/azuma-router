@@ -1,5 +1,7 @@
 """Closed-loop driver: select -> simulated model call -> report, scored against the oracle."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,13 +30,19 @@ class RoundRecord:
         return self.oracle_reward - self.chosen_reward
 
 
-def start_daemon(work_dir: Path, **config_overrides: float) -> tuple[DaemonProcess, dict[str, Any]]:
-    """Writes the world config under `work_dir` and boots a daemon on it."""
+@contextmanager
+def running_daemon(
+    work_dir: Path, **config_overrides: float
+) -> Iterator[tuple[DaemonProcess, dict[str, Any]]]:
+    """Writes the world config under `work_dir` and boots a daemon on it.
+
+    The daemon is always killed and reaped on exit, even if the scenario raises midway.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
     config_path = work_dir / "azuma.toml"
     config_path.write_text(world.build_config_toml(work_dir, **config_overrides), encoding="utf-8")
-    daemon = DaemonProcess(config_path, work_dir / "daemon.stderr.log")
-    return daemon, daemon.start()
+    with DaemonProcess(config_path, work_dir / "daemon.stderr.log") as daemon:
+        yield daemon, daemon.start()
 
 
 def route_and_report(

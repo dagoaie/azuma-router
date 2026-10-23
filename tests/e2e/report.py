@@ -143,11 +143,15 @@ def report_path(output_dir: Path, report_date: str) -> Path:
 
 
 def load_history(output_dir: Path, exclude_date: str) -> list[HistoryEntry]:
-    """Earlier runs, oldest first; the run being rendered (same date) is left out."""
+    """Runs dated strictly before `exclude_date`, oldest first, ordered by their recorded date.
+
+    The run being rendered (same date) and any later run are left out, so regenerating an old
+    report never compares it against the future.
+    """
     entries = []
-    for path in sorted(output_dir.glob("*-results.json")):
+    for path in output_dir.glob("*-results.json"):
         data = json.loads(path.read_text(encoding="utf-8"))
-        if data["meta"]["date"] == exclude_date:
+        if data["meta"]["date"] >= exclude_date:
             continue
         entries.append(
             HistoryEntry(
@@ -158,7 +162,7 @@ def load_history(output_dir: Path, exclude_date: str) -> list[HistoryEntry]:
                 metrics=data["metrics"],
             )
         )
-    return entries
+    return sorted(entries, key=lambda entry: entry.date)
 
 
 def results_json(meta: RunMeta, results: Results) -> dict[str, Any]:
@@ -235,25 +239,49 @@ def render_summary(
     checks_by_scenario: dict[str, list[Check]], results: Results, history: list[HistoryEntry]
 ) -> str:
     rows = [[SCENARIO_TITLES[name], verdict(group)] for name, group in checks_by_scenario.items()]
-    learning = results.learning
-    last = learning.blocks[-1]
     return (
         "## Resumen ejecutivo\n\n"
         "Azuma Router decide, para cada petición, a qué modelo de lenguaje enviarla, y aprende "
         "de los resultados para decidir mejor la vez siguiente, respetando las cuotas de "
         "suscripción.\n\n"
         + table(["Escenario", "Resultado"], rows)
-        + "\n\n**En una frase por escenario:**\n\n"
-        f"- **Aprende:** tras {learning.rounds:,} peticiones elige el mejor modelo en el "
-        f"{last['optimal_rate']:.0%} de los casos y su error es "
-        f"{last['mean_regret'] / learning.random_baseline_regret:.0%} del que tendría repartiendo "
-        "al azar.\n"
-        "- **Respeta la cuota:** frena por sí mismo el uso del modelo con cuota limitada y nunca "
-        "la supera.\n"
-        "- **Resiste caídas:** tras un apagado brusco no se pierde ningún dato confirmado.\n"
-        "- **Resiste entradas hostiles:** mensajes malformados o abusivos se rechazan con un "
-        "error claro y el servicio sigue funcionando."
+        + "\n\n**En una frase por escenario** (solo se afirma lo que ha superado sus "
+        "comprobaciones):\n\n" + _strength_lines(checks_by_scenario, results)
     ) + _first_report_note(history)
+
+
+def _strength_lines(checks_by_scenario: dict[str, list[Check]], results: Results) -> str:
+    learning = results.learning
+    last = learning.blocks[-1]
+    claims = {
+        "learning": (
+            "Aprende",
+            f"tras {learning.rounds:,} peticiones elige el mejor modelo en el "
+            f"{last['optimal_rate']:.0%} de los casos y su error es "
+            f"{last['mean_regret'] / learning.random_baseline_regret:.0%} del que tendría "
+            "repartiendo al azar.",
+        ),
+        "quota": (
+            "Respeta la cuota",
+            "frena por sí mismo el uso del modelo con cuota limitada y nunca la supera.",
+        ),
+        "recovery": (
+            "Resiste caídas",
+            "tras un apagado brusco no se pierde ningún dato confirmado.",
+        ),
+        "hostile": (
+            "Resiste entradas hostiles",
+            "mensajes malformados o abusivos se rechazan con un error claro y el servicio "
+            "sigue funcionando.",
+        ),
+    }
+    lines = []
+    for name, (label, claim) in claims.items():
+        if all(c.passed for c in checks_by_scenario[name]):
+            lines.append(f"- ✅ **{label}:** {claim}")
+        else:
+            lines.append(f"- ❌ **{label}:** no se cumple; ver las comprobaciones fallidas.")
+    return "\n".join(lines)
 
 
 def _first_report_note(history: list[HistoryEntry]) -> str:
@@ -436,9 +464,14 @@ def render_hostile(result: scenarios.HostileResult, group: list[Check]) -> str:
         f"**Qué se hace:** se envían {len(result.probes)} mensajes malformados, inválidos o "
         "abusivos (JSON roto, valores imposibles, mensajes de más de 1 MiB…).\n\n"
         "**Qué esperamos:** un error claro para cada uno, que el servicio no se caiga y que "
-        "ningún mensaje malo estropee el siguiente. Incluye los dos fallos de seguridad "
-        "corregidos en este proyecto (un mensaje demasiado largo ya no «se come» al "
-        "siguiente, y los errores internos ya no revelan detalles al cliente).\n\n"
+        "ningún mensaje malo estropee el siguiente. Incluye uno de los dos fallos de seguridad "
+        "corregidos en este proyecto: un mensaje demasiado largo ya no «se come» al "
+        "siguiente.\n\n"
+        "**Fuera de esta prueba:** que los errores *internos* del servicio no revelan detalles "
+        "al cliente no se puede provocar desde fuera sin modificar el código, por lo que aquí "
+        "no se verifica; lo cubre una prueba unitaria "
+        "(`tests/test_jsonrpc_loop.py`, que fuerza un fallo interno y comprueba que el cliente "
+        "solo recibe «Internal error»).\n\n"
         "**Comprobaciones:**\n\n" + checks_table(group)
     )
 
@@ -488,6 +521,10 @@ concurrente de varios clientes.
   - Límite al número de decisiones pendientes (hoy puede crecer sin tope).
   - Comprobación de propietario y permisos del directorio de datos al arrancar.
   - Lectura del registro de decisiones en streaming (hoy se carga entero al recuperar).
+- **Qué es criterio y qué es medición.** Las tablas de «Comprobaciones» son los criterios de \
+aprobado: si uno falla, el informe lo declara. El resto de cifras (peticiones por segundo, \
+evaluación offline, reparto por tramos) son mediciones descriptivas para seguir la evolución, \
+sin umbral de aprobado.
 - **Cuota:** el router *raciona* el modelo con cuota de forma suave; lo que garantiza no \
 superarla es el rechazo duro al llegar al tope."""
 

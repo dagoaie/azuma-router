@@ -25,7 +25,11 @@ class RpcCallError(Exception):
 
 
 class DaemonProcess:
-    """One daemon process: start, call, crash (SIGKILL) or stop (SIGTERM)."""
+    """One daemon process: start, call, crash (SIGKILL) or stop (SIGTERM).
+
+    Use it as a context manager: leaving the block always kills and reaps the process, so a
+    failing scenario never leaves a daemon or open streams behind.
+    """
 
     def __init__(self, config_path: Path, stderr_path: Path) -> None:
         self._config_path = config_path
@@ -36,8 +40,28 @@ class DaemonProcess:
         self._next_id = 0
         self.call_latencies_ms: dict[str, list[float]] = {}
 
+    def __enter__(self) -> "DaemonProcess":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+    @property
+    def is_running(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
     def start(self) -> dict[str, Any]:
-        """Launches the daemon and returns the params of its `ready` notification."""
+        """Launches the daemon and returns the params of its `ready` notification.
+
+        If the daemon never becomes ready, it is killed and reaped before the error propagates.
+        """
+        try:
+            return self._launch()
+        except BaseException:
+            self.close()
+            raise
+
+    def _launch(self) -> dict[str, Any]:
         self._stderr_file = self._stderr_path.open("a", encoding="utf-8")
         command = [sys.executable, "-m", "azuma_router.daemon", "--config", str(self._config_path)]
         self._process = subprocess.Popen(
@@ -89,6 +113,17 @@ class DaemonProcess:
         """Reads the next response line (used after `write_raw`)."""
         return dict(json.loads(self._readline()))
 
+    def close(self) -> None:
+        """Kills the daemon if it is still alive and releases its streams; safe to repeat."""
+        if self._process is None:
+            self._close_stderr()
+            return
+        self._process.kill()
+        try:
+            self._process.wait(timeout=SHUTDOWN_TIMEOUT_S)
+        finally:
+            self._release()
+
     def kill(self) -> int:
         """Crashes the daemon with SIGKILL (no shutdown snapshot) and returns its exit code."""
         return self._stop(signal.SIGKILL)
@@ -111,9 +146,13 @@ class DaemonProcess:
         for stream in (process.stdin, process.stdout):
             if stream is not None:
                 stream.close()
+        self._close_stderr()
+        self._process = None
+
+    def _close_stderr(self) -> None:
         if self._stderr_file is not None:
             self._stderr_file.close()
-        self._process = None
+            self._stderr_file = None
 
     def _pump_stdout(self, stdout: TextIO) -> None:
         """Moves stdout lines onto a queue so reads can time out instead of hanging a test."""
@@ -125,17 +164,13 @@ class DaemonProcess:
         try:
             line = self._lines.get(timeout=READ_TIMEOUT_S)
         except queue.Empty:
-            self._kill_if_running()
+            self.close()
             raise TimeoutError(
                 f"no response within {READ_TIMEOUT_S}s; see {self._stderr_path}"
             ) from None
         if line is None:
             raise RuntimeError(f"daemon closed stdout; see {self._stderr_path}")
         return line
-
-    def _kill_if_running(self) -> None:
-        if self._process is not None:
-            self._process.kill()
 
     def _require_process(self) -> subprocess.Popen[str]:
         if self._process is None:
