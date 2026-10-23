@@ -204,3 +204,35 @@ def test_a_pathologically_nested_line_is_a_parse_error_and_the_loop_survives(
 
     assert json.loads(out[0])["error"]["code"] == -32700
     assert json.loads(out[1])["id"] == 9
+
+
+def test_jsonrpc_loop_unexpected_error_hides_detail_from_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Security audit #4: exception text (paths, internals) goes to stderr, never to the client."""
+    cfg = load_config("fixtures/config/azuma.valid.toml")
+    router = Router(
+        config=cfg, snapshot_dir=tmp_path / ".azuma", decision_log_path=tmp_path / "d.jsonl"
+    )
+    router.boot()
+
+    def explode(_params: dict[str, object]) -> dict[str, object]:
+        raise RuntimeError("boom at /private/state/dir/secret.bin")
+
+    monkeypatch.setattr(router, "health", explode)
+
+    stdin = io.StringIO('{"jsonrpc":"2.0","id":7,"method":"health"}\n')
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    serve(stdin, stdout, stderr, router, exit_on_eof=False)
+
+    response = json.loads(stdout.getvalue())
+    assert response["id"] == 7
+    assert response["error"] == {"code": -32603, "message": "Internal error"}
+    assert "secret.bin" not in stdout.getvalue()
+
+    logged = json.loads(stderr.getvalue().strip().splitlines()[-1])
+    assert logged["event"] == "unhandled_error"
+    assert "/private/state/dir/secret.bin" in logged["error"]
+
+    router.close()

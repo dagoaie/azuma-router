@@ -901,7 +901,7 @@ def _handle_request(
     except Exception as err:
         _log_event(stderr, "error", "unhandled_error", error=str(err))
         if not is_notification:
-            _write_response(stdout, _error_response(req_id, -32603, f"Internal error: {err}"))
+            _write_response(stdout, _error_response(req_id, -32603, "Internal error"))
 
 
 class ShutdownCoordinator:
