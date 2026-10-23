@@ -121,6 +121,7 @@ w_latency = {W_LATENCY}
 cost_budget_usd = {COST_BUDGET_USD}
 latency_budget_s = {LATENCY_BUDGET_S}
 pending_ttl_s = 3600
+max_pending = 10000
 snapshot_dir = "{(work_dir / "snapshots").as_posix()}"
 snapshot_every_updates = {snapshot_every_updates}
 snapshot_every_s = 3600

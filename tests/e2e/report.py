@@ -517,10 +517,9 @@ las cifras demuestran que la herramienta *funciona como está diseñada*, no cu�
 producción. Una prueba con modelos reales es el siguiente paso natural.
 - **Un solo proceso.** Se prueba un servicio con un único cliente; no se ha probado carga \
 concurrente de varios clientes.
-- **Pendientes de la auditoría de seguridad del servicio** (decisiones aplazadas, no olvidadas):
-  - Límite al número de decisiones pendientes (hoy puede crecer sin tope).
-  - Comprobación de propietario y permisos del directorio de datos al arrancar.
-  - Lectura del registro de decisiones en streaming (hoy se carga entero al recuperar).
+- **Auditoría de seguridad del servicio.** Ya incorporados: límite al número de decisiones \
+pendientes y lectura en streaming del registro de decisiones. En revisión: comprobación de \
+propietario y permisos del directorio de datos al arrancar. Esta prueba no los sondea todavía.
 - **Qué es criterio y qué es medición.** Las tablas de «Comprobaciones» son los criterios de \
 aprobado: si uno falla, el informe lo declara. El resto de cifras (peticiones por segundo, \
 evaluación offline, reparto por tramos) son mediciones descriptivas para seguir la evolución, \
