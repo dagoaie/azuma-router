@@ -25,5 +25,7 @@ jobs:
         run: uv run mypy
       - name: test
         run: uv run pytest
+      - name: e2e (real daemon, simulated world)
+        run: uv run pytest -m e2e
       - name: bench (informational)
         run: uv run pytest -m bench --benchmark-only -q || true

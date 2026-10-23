@@ -15,6 +15,7 @@ w_latency = 0.2
 cost_budget_usd = 0.05
 latency_budget_s = 30.0
 pending_ttl_s = 3600
+max_pending = 10000
 snapshot_dir = ".azuma"
 snapshot_every_updates = 100
 snapshot_every_s = 3600
